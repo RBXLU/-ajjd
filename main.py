@@ -5069,51 +5069,21 @@ def login_to_website(message):
         'chat_id': chat_id
     }
 
+    session_id = create_session(user_id_db, telegram_data)
+    login_url = f"{NGROK_URL}/api/telegram-login/{session_id}"
+
     markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("🔗 По ссылке", callback_data="login_method_link"),
-        types.InlineKeyboardButton("🔑 По коду", callback_data="login_method_code")
-    )
+    markup.add(types.InlineKeyboardButton("🌐 Перейти на сайт", url=login_url))
+    markup.add(types.InlineKeyboardButton("🔑 Получить код", callback_data="login_method_code"))
 
     instructions = (
-        "🔐 *Выберите способ входа*\n\n"
-        "🔗 По ссылке: бот пришлет кнопку и QR-код.\n"
-        "🔑 По коду: бот пришлет одноразовый код, который нужно ввести на сайте.\n\n"
-        f"Оба варианта действуют {LOGIN_CODE_EXPIRE_MINUTES} минут."
+        f"🔐 *Ссылка для входа на сайт*\n\n"
+        f"Нажмите кнопку ниже, чтобы сразу открыть сайт.\n"
+        f"Если вы хотите войти по коду, нажмите кнопку «Получить код».\n\n"
+        f"Ссылка действует {LOGIN_CODE_EXPIRE_MINUTES} минут."
     )
 
     bot.send_message(chat_id, instructions, reply_markup=markup, parse_mode='Markdown')
-    return
-
-    session_id = create_session(user_id_db, telegram_data)
-    
-    # Ссылка для входа
-    login_url = f"{NGROK_URL}/api/telegram-login/{session_id}"
-    
-    # Создаем кнопку
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🌐 Перейти на сайт", url=login_url))
-    
-    # Отправляем инструкцию
-    instructions = (
-        f"🔐 *Ссылка для входа на сайт*\n\n"
-        f"1. Нажмите кнопку ниже\n"
-        f"2. Или перейдите по ссылке:\n"
-        f"`{login_url}`\n\n"
-        f"⚠️ *Внимание:*\n"
-        f"• Ссылка действительна 1 час\n"
-        f"• Не передавайте её другим\n"
-        f"• После входа вы сможете создавать ссылки"
-    )
-    
-    bot.send_message(
-        chat_id,
-        instructions,
-        reply_markup=markup,
-        parse_mode='Markdown'
-    )
-    
-    # Отправляем QR-код для входа
     send_telegram_qr_code(chat_id, login_url, "QR-код для входа на сайт")
 
 @bot.message_handler(func=lambda m: m.text == "📋 Мои ссылки")
